@@ -1556,6 +1556,15 @@ class ParallelTransformer(MegatronModule):
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,
                     layer_number)
+                # Use DeltaNet linear attention layer if --use-deltanet
+                if getattr(args, 'use_deltanet', False):
+                    from megatron.model.deltanet_layer import DeltaNetTransformerLayer
+                    return DeltaNetTransformerLayer(
+                        config,
+                        layer_number,
+                        layer_type=current_layer_type,
+                        self_attn_mask_type=self_attn_mask_type,
+                        drop_path_rate=self.drop_path_rates[layer_number - 1])
                 return ParallelTransformerLayer(
                     config,
                     layer_number,

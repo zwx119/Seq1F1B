@@ -38,6 +38,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_deltanet_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -376,9 +377,29 @@ def validate_args(args, defaults={}):
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
 
+    # DeltaNet: override positional embedding settings.
+    if args.use_deltanet:
+        # DeltaNet uses short convolutions instead of positional embeddings.
+        # Disable RoPE and learned absolute PE to avoid conflicts.
+        args.position_embedding_type = 'none'
+        args.add_position_embedding = False
+        args.use_rotary_position_embeddings = False
+        # DeltaNet is incompatible with flash attention (they are alternatives)
+        if args.use_flash_attn:
+            raise RuntimeError(
+                '--use-deltanet and --use-flash-attn are mutually exclusive. '
+                'DeltaNet replaces softmax attention entirely.')
+        # DeltaNet requires fla library
+        try:
+            from fla.ops.delta_rule import chunk_delta_rule  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                '--use-deltanet requires the flash-linear-attention (fla) '
+                'library. Install with: pip install flash-linear-attention')
+
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
-    if not args.add_position_embedding and args.position_embedding_type != 'rope':
+    if not args.add_position_embedding and args.position_embedding_type not in ('rope', 'none'):
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
     # Print arguments.
@@ -537,6 +558,55 @@ def _add_retro_args(parser):
     return parser
 
 
+def _add_deltanet_args(parser):
+    group = parser.add_argument_group(title='deltanet')
+
+    group.add_argument('--use-deltanet', action='store_true', default=False,
+                       help='Replace softmax attention with DeltaNet linear '
+                       'attention. When enabled, RoPE is automatically '
+                       'disabled and short convolutions are used instead.')
+    group.add_argument('--deltanet-mode', type=str, default='chunk',
+                       choices=['chunk', 'fused_recurrent'],
+                       help='DeltaNet computation mode: "chunk" uses '
+                       'chunk_delta_rule (training), "fused_recurrent" uses '
+                       'fused_recurrent_delta_rule (inference).')
+    group.add_argument('--deltanet-use-short-conv', action='store_true',
+                       default=True,
+                       help='Use short convolutions (causal 1-D conv) on Q, '
+                       'K, V before the delta-rule computation. Default: True.')
+    group.add_argument('--no-deltanet-short-conv', action='store_false',
+                       dest='deltanet_use_short_conv',
+                       help='Disable short convolutions in DeltaNet.')
+    group.add_argument('--deltanet-conv-size', type=int, default=4,
+                       help='Kernel size for short convolutions. Default: 4.')
+    group.add_argument('--deltanet-use-beta', action='store_true',
+                       default=True,
+                       help='Use learned per-token beta (step size) for the '
+                       'delta rule update. Default: True.')
+    group.add_argument('--no-deltanet-beta', action='store_false',
+                       dest='deltanet_use_beta',
+                       help='Disable learned beta, using fixed beta=1.')
+    group.add_argument('--deltanet-use-output-gate', action='store_true',
+                       default=True,
+                       help='Use an output gating mechanism. Default: True.')
+    group.add_argument('--no-deltanet-output-gate', action='store_false',
+                       dest='deltanet_use_output_gate',
+                       help='Disable output gate.')
+    group.add_argument('--deltanet-qk-activation', type=str, default='silu',
+                       choices=['silu', 'relu', 'elu', 'identity', 'none'],
+                       help='Activation function applied to Q and K. '
+                       'Default: silu.')
+    group.add_argument('--deltanet-qk-norm', type=str, default='l2',
+                       choices=['l2', 'none'],
+                       help='Normalization applied to Q and K after '
+                       'activation. "l2" normalizes by sqrt(d). Default: l2.')
+    group.add_argument('--deltanet-head-dim', type=int, default=None,
+                       help='Per-head dimension (d_k = d_v) for DeltaNet. '
+                       'If not set, defaults to kv_channels from model args.')
+
+    return parser
+
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -566,8 +636,9 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                       choices=['learned_absolute', 'rope'],
-                       help='Position embedding type.')
+                       choices=['learned_absolute', 'rope', 'none'],
+                       help='Position embedding type. Use "none" for models '
+                       'that do not use positional embeddings (e.g. DeltaNet).')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
