@@ -81,7 +81,7 @@ options=" \
     --deltanet-use-short-conv \
     --deltanet-use-beta \
     --deltanet-use-output-gate \
-    --data-path ${DATA_PATH}/data/codeparrot_content_document \
+    --data-path ${DATA_PATH}/data/codeparrot_content_document_text_document \
     --vocab-file ${DATA_PATH}/data/vocab.json \
     --merge-file ${DATA_PATH}/data/merges.txt \
     --initial-loss-scale 65536 \
