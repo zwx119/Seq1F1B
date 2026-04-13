@@ -73,7 +73,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q = q.contiguous()
         k_whole = k_whole.contiguous()
         v_whole = v_whole.contiguous()
-        out, q, k_whole, v_whole, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+        out, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q,
             k_whole,
             v_whole,
@@ -91,8 +91,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
         ctx._kv_cache = kv_cache
         ctx.save_for_backward(
-            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state,
-
+            q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state,
         )
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
