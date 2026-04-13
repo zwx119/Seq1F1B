@@ -1,0 +1,174 @@
+3 Methodology
+
+In this section, we first review the cross-span state dependency problem in Seq1F1B (Section 3.1). Then, we introduce DeltaNet linear attention and explain why its recurrent formulation naturally resolves this problem (Section 3.2). Finally, we present the detailed design of our integration and analyze its memory benefits (Section 3.3).
+
+3.1 Cross-Span State Dependency in Seq1F1B
+
+As introduced in (Sun et al., 2024), Seq1F1B splits each input sequence S = {x_1, x_2, ..., x_T} into k sub-sequences (spans) S = {S_1, S_2, ..., S_k} and schedules pipeline stages at the sequence level. Due to the causal nature of language modeling, the attention output of a token x_t in span S_j must attend to all preceding tokens in S_1, ..., S_j, not just within S_j itself. In the original Seq1F1B with softmax attention, this inter-span dependency is resolved by caching the key-value (KV) pairs of all preceding spans. Concretely, a KV cache is maintained throughout the forward passes:
+
+    K_{<=j} = Concat(K_1, K_2, ..., K_j),
+    V_{<=j} = Concat(V_1, V_2, ..., V_j),                                (1)
+
+and the attention output for span S_j is computed as:
+
+    O_j = softmax(Q_j K_{<=j}^T / sqrt(d_k)) V_{<=j}.                    (2)
+
+During the backward pass, the KV cache is consumed in reverse order (FILO within each micro-batch) to reconstruct the full attention context.
+
+While this mechanism preserves the exact semantics of full-sequence training, it introduces a critical memory bottleneck: the cached KV pairs grow linearly with the number of processed tokens. For the j-th span, the cache size is:
+
+    M_KV(j) = 2 * j * (T/k) * d,                                         (3)
+
+where d is the model dimension. At the last span (j = k), the peak cache size reaches 2Td, equivalent to storing the KV pairs of the entire sequence. This effectively negates the memory advantage of sequence splitting for long sequences and limits Seq1F1B's scalability. As the sequence length T grows, this linearly accumulating cache becomes the dominant memory bottleneck, leading to out-of-memory failures on commodity GPUs.
+
+
+3.2 DeltaNet: Linear Attention with Fixed-Size State
+
+To address the above limitation, we propose replacing softmax attention with DeltaNet (Yang et al., 2024), a linear attention mechanism based on the delta rule. The key insight is that DeltaNet maintains a fixed-size recurrent state S_t in R^{d_k x d_v} that compresses all historical information, regardless of sequence length.
+
+3.2.1 Recurrent Formulation
+
+Given input projections q_t, k_t, v_t in R^d and a learned scalar beta_t in (0, 1) at each time step t, DeltaNet updates its state via the delta rule:
+
+    S_t = S_{t-1} + beta_t * k_t (v_t - k_t^T S_{t-1})^T,               (4)
+
+where the term v_t - k_t^T S_{t-1} represents the "delta" between the target value v_t and the current retrieved value k_t^T S_{t-1}. The output at time step t is:
+
+    o_t = q_t^T S_t.                                                      (5)
+
+Crucially, S_t has a fixed size of d_k x d_v, independent of the number of tokens processed. This is in sharp contrast to the softmax KV cache, which grows as O(t * d).
+
+3.2.2 Chunk-Wise Parallel Algorithm
+
+For efficient GPU computation, the recurrent form in Eq. (4) is impractical, as its sequential nature prevents parallelization. Following (Yang and Zhang, 2024), we employ a chunk-wise algorithm that divides the sequence into chunks of size C (typically C = 64) and decomposes computation into two parts:
+
+  - Intra-chunk: The attention within each chunk is computed in parallel via matrix multiplication:
+
+    A_{ij} = q_i^T k_j * beta_j,  for i, j within the same chunk,        (6)
+
+  which is computed as a dense C x C matrix and can be efficiently parallelized on GPU.
+
+  - Inter-chunk: The recurrent state S is propagated across chunks sequentially:
+
+    S_{c+1} = f(S_c, K_c, V_c, beta_c),                                  (7)
+
+  where c indexes the chunk. This inter-chunk propagation incurs only O(T/C) sequential steps.
+
+The chunk-wise algorithm achieves O(T * d^2 / C + T * C * d) FLOPs, which is subquadratic in T when C << T. The chunk size C = 64 is pinned by GPU shared memory and register constraints.
+
+
+3.3 Integration: DeltaNet x Seq1F1B
+
+We now describe how DeltaNet is integrated into the Seq1F1B pipeline schedule. The integration exploits DeltaNet's fixed-size state to replace the linearly growing KV cache, while preserving the correctness and parallelism properties of the original schedule.
+
+3.3.1 Cross-Span State Passing
+
+In our design, each DeltaNet layer l maintains a recurrent state S^{(l)} that accumulates context across spans. When Seq1F1B processes the k spans of a micro-batch sequentially, the state is passed between spans as follows:
+
+For the first span (j = 1):
+
+    S_0^{(l)} = 0,                                                        (8)
+
+For subsequent spans (j > 1):
+
+    S_{j-1}^{(l)} = sg(S_{j-1, final}^{(l)}),                            (9)
+
+where S_{j-1, final}^{(l)} is the final recurrent state after processing span S_{j-1} at layer l, and sg(*) denotes the stop-gradient operator. The DeltaNet computation for span S_j at layer l is then:
+
+    O_j^{(l)}, S_{j, final}^{(l)} = ChunkDeltaRule(
+        Q_j^{(l)}, K_j^{(l)}, V_j^{(l)}, beta_j^{(l)};
+        S_{j-1}^{(l)}
+    ).                                                                     (10)
+
+The stop-gradient in Eq. (9) is essential for the correctness of Seq1F1B's pipeline schedule. In the 1F1B schedule, the backward pass of span S_j is executed before the backward pass of span S_{j-1} (FILO order in the sequence dimension). If gradients were allowed to flow from S_j back through S_{j-1}, the computational graph of S_{j-1} would need to remain alive during the backward pass of S_j, which contradicts the memory reclamation strategy of the 1F1B schedule. The stop-gradient operator cleanly isolates each span's computational graph while still allowing the forward-pass information to propagate through the recurrent state.
+
+3.3.2 Short Convolution State Passing
+
+DeltaNet replaces positional encodings (e.g., RoPE) with causal short convolutions applied to the Q, K, V projections. With a kernel size of kappa (default kappa = 4), these convolutions have a sliding window state of size kappa - 1 that must also be passed across spans:
+
+    Q_j_tilde, C_j^q = ShortConv(Q_j; C_{j-1}^q),                       (11)
+
+where C_{j-1}^q in R^{d x (kappa-1)} is the cached convolution state from the previous span, and Q_j_tilde is the convolution output with SiLU activation. The same applies to K and V. Like the recurrent state, the convolution state is detached via stop-gradient:
+
+    C_j^q = sg(C_{j, final}^q).                                          (12)
+
+The convolution state has size d x (kappa - 1), which is also constant with respect to the sequence length.
+
+3.3.3 Architecture
+
+Each transformer layer in our model follows the pre-norm architecture consistent with Seq1F1B:
+
+    Y = X + DeltaNetAttn(LN(X)),
+    Z = Y + MLP(LN(Y)),                                                  (13)
+
+where DeltaNetAttn replaces the standard multi-head softmax attention. The MLP, layer normalization (LN), residual connections, and bias-dropout-add fusion remain identical to the original implementation.
+
+For tensor parallelism (TP), we follow the Megatron-LM strategy (Shoeybi et al., 2019): the Q, K, V projections use ColumnParallelLinear (splitting attention heads across TP ranks), and the output projection uses RowParallelLinear (gathering across TP ranks). This ensures seamless integration with Megatron's 3D parallelism (DP + TP + PP).
+
+3.3.4 Summary of Changes
+
+The complete integration requires modifications to only the attention computation within each transformer layer. Specifically:
+
+  (a) ParallelAttention (softmax + FlashAttention) is replaced by DeltaNetAttention (delta rule + chunk algorithm).
+  (b) The KV cache dictionary (kv_cache with 'k_cache' and 'v_cache' growing via concatenation) is replaced by a fixed-size recurrent state (S in R^{H x d_k x d_v}) and convolution states (C in R^{d x (kappa-1)}).
+  (c) RoPE positional encoding is replaced by short convolutions, which serve as a position-aware input transformation.
+
+All other components of the Seq1F1B pipeline -- the partially ordered queue Q_s, the warm-up/steady/cooling-down phases, the computation-wise partition strategy, and the gradient accumulation mechanism -- remain completely unchanged.
+
+
+3.4 Memory Analysis
+
+We now formally analyze the cross-span memory overhead for both approaches.
+
+3.4.1 Softmax KV Cache (Original)
+
+For a model with L layers, and Seq1F1B with k spans of length T/k each, the KV cache at span j for a single layer is:
+
+    M_softmax^{(l)}(j) = 2 * j * (T/k) * d.                              (14)
+
+Summing across all layers and taking the peak (j = k):
+
+    M_softmax^peak = sum_{l=1}^{L} 2Td = 2LTd.                           (15)
+
+This grows linearly with both sequence length T and model depth L.
+
+3.4.2 DeltaNet Recurrent State (Ours)
+
+For a model with H attention heads and head dimension d_h = d / H, the cached state per layer is:
+
+    M_DeltaNet^{(l)} = H * d_h * d_h + 3 * d * (kappa - 1)
+                     = d^2 / H + 3d(kappa - 1).                           (16)
+
+The first term is the recurrent state S and the second is the three convolution caches (Q, K, V). Summing across all layers:
+
+    M_DeltaNet^peak = L * (d^2/H + 3d(kappa - 1)).                        (17)
+
+Critically, this is independent of the sequence length T and the span index j.
+
+3.4.3 Memory Saving Ratio
+
+The ratio of cross-span cache memory is:
+
+    M_softmax^peak / M_DeltaNet^peak = 2Td / (d^2/H + 3d(kappa-1))
+                                     ~= 2TH / d,                          (18)
+
+where the approximation holds when the recurrent state dominates (d/H >> 3(kappa-1), which is true for typical configurations). For a concrete example with T = 32768, H = 32, d = 4096:
+
+    Saving ratio ~= (2 * 32768 * 32) / 4096 = 512x.                       (19)
+
+This means that the cross-span state overhead of DeltaNet is roughly 512 times smaller than the softmax KV cache. For even longer sequences (T = 131072), the ratio grows to over 2000x. This dramatic reduction in cross-span memory is what enables Seq1F1B with DeltaNet to efficiently train on sequences that would cause out-of-memory failures with softmax attention.
+
+We note that this analysis concerns only the cached state between spans. The per-span activation memory (for the chunk computation within each span of length T/k) is O(T/k * d) for both approaches and is not affected by our replacement. The key advantage of DeltaNet lies in eliminating the linearly growing inter-span cache.
+
+
+3.5 Two-Level Chunking Hierarchy
+
+Our integration introduces a two-level chunking hierarchy:
+
+  Level 1 -- Pipeline spans: Seq1F1B partitions the sequence into k spans (typically k = 4) with lengths determined by the computation-wise partition strategy (Eq. 7 in Sun et al., 2024). Each span is scheduled as an independent pipeline unit in the 1F1B schedule.
+
+  Level 2 -- DeltaNet chunks: Within each span, the chunk-wise algorithm further divides the span into chunks of size C = 64 for parallel GPU computation (Section 3.2.2).
+
+These two levels serve orthogonal purposes and operate at different granularities. The span size (typically 1024-8192 tokens) is optimized for pipeline efficiency (load balancing and bubble reduction), while the chunk size C = 64 is fixed by GPU hardware constraints (shared memory limits the intra-chunk attention matrix to C x C). The recurrent state S flows across both levels: across chunks within a span (handled by the chunk kernel), and across spans (handled by our state passing mechanism in Eqs. 8-10).
+
+This hierarchical structure is analogous to how the original Seq1F1B uses the partially ordered queue to manage the pipeline schedule at the span level while the attention computation at the token level is handled by FlashAttention. Our replacement simply swaps the token-level mechanism from softmax (with growing KV cache) to delta rule (with fixed-size state), without changing the span-level pipeline schedule at all.
