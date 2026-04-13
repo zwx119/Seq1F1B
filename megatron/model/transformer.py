@@ -83,9 +83,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k,
             dropout_p,
             softmax_scale,
-            block_table=None,
             causal=causal,
-            window_size=(-1, -1),
+            window_size_left=-1,
+            window_size_right=-1,
             alibi_slopes=None,
             return_softmax=False,
         )
@@ -134,9 +134,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
-            (-1,-1),
-            None,
-            False,
+            window_size_left=-1,
+            window_size_right=-1,
+            alibi_slopes=None,
+            deterministic=False,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
