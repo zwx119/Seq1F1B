@@ -249,16 +249,37 @@ class DeltaNetAttention(MegatronModule):
             if micro_sp_idx == 0:
                 self._clear_states()
 
-        # Megatron uses [s, b, h], but DeltaNet/fla expects [b, s, h]
-        # Transpose: [s, b, h] -> [b, s, h]
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
-        batch_size, seq_len, _ = hidden_states.shape
+        # hidden_states: [s, b, h] (Megatron convention)
+        # When sequence_parallel is True and TP>1, shape is [s/tp, b, h].
+        # ColumnParallelLinear expects [s, b, h] format and internally does
+        # all-gather along dim-0 (the seq dimension). So we must NOT
+        # transpose before calling the projections.
 
-        # ============ Projections ============
-        # ColumnParallelLinear returns (output, bias)
-        q, _ = self.q_proj(hidden_states)  # [b, s, key_dim_per_partition]
-        k, _ = self.k_proj(hidden_states)  # [b, s, key_dim_per_partition]
-        v, _ = self.v_proj(hidden_states)  # [b, s, value_dim_per_partition]
+        # ============ Projections (keep [s, b, h] for ColumnParallelLinear) ============
+        # ColumnParallelLinear: [s(/tp), b, h] -> all-gather dim-0 -> [s, b, h] -> matmul -> [s, b, h/tp]
+        q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
+        k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
+        v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
+
+        # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
+        q = q.transpose(0, 1).contiguous()
+        k = k.transpose(0, 1).contiguous()
+        v = v.transpose(0, 1).contiguous()
+
+        # Also prepare hidden_states for b_proj (nn.Linear, no internal all-gather).
+        # When sequence_parallel=True, hidden_states is [s/tp, b, h], but
+        # b_proj needs full seq_len to match q/k/v (which were all-gathered by ColumnParallelLinear).
+        if self.use_beta and self.sequence_parallel and mpu.get_tensor_model_parallel_world_size() > 1:
+            # All-gather hidden_states along dim-0 to get full seq for b_proj
+            hidden_states_full = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=True
+            )
+            # [s, b, h] -> [b, s, h]
+            hidden_states_bsh = hidden_states_full.transpose(0, 1).contiguous()
+        else:
+            # [s, b, h] -> [b, s, h]
+            hidden_states_bsh = hidden_states.transpose(0, 1).contiguous()
+        batch_size, seq_len, _ = hidden_states_bsh.shape
 
         # ============ Short Convolutions ============
         if self.use_short_conv:
@@ -308,8 +329,8 @@ class DeltaNetAttention(MegatronModule):
 
         # ============ Beta ============
         if self.use_beta:
-            # hidden_states is [b, s, h], b_proj outputs [b, s, num_heads_per_partition]
-            beta = self.b_proj(hidden_states).sigmoid()
+            # hidden_states_bsh is [b, s, h] (full seq), b_proj outputs [b, s, num_heads_per_partition]
+            beta = self.b_proj(hidden_states_bsh).sigmoid()
         else:
             beta = torch.ones(
                 batch_size, seq_len, self.num_attention_heads_per_partition,
@@ -349,7 +370,10 @@ class DeltaNetAttention(MegatronModule):
 
         # ============ Output normalization & gate ============
         if self.use_gate:
-            g, _ = self.g_proj(hidden_states)
+            # g_proj is ColumnParallelLinear, expects [s(/tp), b, h] format
+            # It handles all-gather internally when sequence_parallel=True
+            g, _ = self.g_proj(hidden_states)    # [s, b, h/tp]
+            g = g.transpose(0, 1).contiguous()   # [b, s, h/tp]
             g = rearrange(g, 'b s (h d) -> b s h d', d=self.head_dim)
             o = self.o_norm(o, g)
         else:
@@ -359,11 +383,12 @@ class DeltaNetAttention(MegatronModule):
         # [b, s, num_heads_per_partition, head_dim] -> [b, s, hidden_per_partition]
         o = rearrange(o, 'b s h d -> b s (h d)')
 
-        # RowParallelLinear: gathers across TP ranks, returns (output, bias)
-        output, bias = self.o_proj(o)
+        # RowParallelLinear expects [s, b, h/tp] format for correct reduce-scatter along dim-0
+        o = o.transpose(0, 1).contiguous()  # [b, s, h/tp] -> [s, b, h/tp]
 
-        # Transpose back to Megatron convention: [b, s, h] -> [s, b, h]
-        output = output.transpose(0, 1).contiguous()
+        # RowParallelLinear: matmul + reduce-scatter -> [s/tp, b, h] (when sequence_parallel)
+        # or matmul + all-reduce -> [s, b, h] (when not sequence_parallel)
+        output, bias = self.o_proj(o)
         if bias is not None:
             # bias is [h], needs to be compatible with [s, b, h]
             pass
