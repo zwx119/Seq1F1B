@@ -266,21 +266,25 @@ class DeltaNetAttention(MegatronModule):
             use_conv_cache = (args.pipe_sp_splits > 1 and micro_sp_idx is not None
                               and micro_sp_idx > 0)
 
-            q, self.conv_state_q = self.q_conv1d(
+            q, conv_state_q = self.q_conv1d(
                 x=q,
                 cache=self.conv_state_q if use_conv_cache else None,
                 output_final_state=(args.pipe_sp_splits > 1),
             )
-            k, self.conv_state_k = self.k_conv1d(
+            k, conv_state_k = self.k_conv1d(
                 x=k,
                 cache=self.conv_state_k if use_conv_cache else None,
                 output_final_state=(args.pipe_sp_splits > 1),
             )
-            v, self.conv_state_v = self.v_conv1d(
+            v, conv_state_v = self.v_conv1d(
                 x=v,
                 cache=self.conv_state_v if use_conv_cache else None,
                 output_final_state=(args.pipe_sp_splits > 1),
             )
+            # Detach conv states to prevent backward through previous span's graph
+            self.conv_state_q = conv_state_q.detach() if conv_state_q is not None else None
+            self.conv_state_k = conv_state_k.detach() if conv_state_k is not None else None
+            self.conv_state_v = conv_state_v.detach() if conv_state_v is not None else None
         else:
             # Without short conv, apply activation directly
             if self.qk_activation == 'silu':
