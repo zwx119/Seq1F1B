@@ -86,6 +86,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=-1,
             window_size_right=-1,
+            softcap=0.0,
             alibi_slopes=None,
             return_softmax=False,
         )
@@ -135,6 +136,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.causal,
             window_size_left=-1,
             window_size_right=-1,
+            softcap=0.0,
             alibi_slopes=None,
             deterministic=False,
             rng_state=rng_state,
