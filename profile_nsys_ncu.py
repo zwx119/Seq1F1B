@@ -145,12 +145,27 @@ if args.mode == "nsys":
     print("查看: nsys-ui deltanet_nsys.nsys-rep")
 
 elif args.mode == "ncu":
-    # ncu 外部启动，这里只需要跑目标 kernel
-    # ncu 会自动拦截匹配的 kernel 做详细分析
+    # ncu 外部启动
+    # 关键: 用 cudaProfilerStart/Stop 精确控制 ncu 只捕获目标迭代
+    # ncu 需要加 --replay-mode application --target-processes all
+    # 或者更简单地: 只跑 1 次 forward, warmup 已经在上面完成
+    print("Starting ncu-targeted forward (warmup already done)...")
+    print("NOTE: Use ncu with --launch-skip and --launch-count to target specific kernels")
+    print(f"  Autotune caches should be warm. Expected launches per fwd:")
+    print(f"    🔥1 kkt:       {(T//64) * 1 * H} (NT*B*H)")
+    print(f"    🔥2 solve_tril: {(T//64) * 1 * H}")
+    print(f"    🔥3 recompute:  {(T//64) * 1 * H}")
+    print(f"    🔥4 fwd_h:      {(128 // 32) * 1 * H}..{(128 // 64) * 1 * H} (ceil(V/BV)*B*H)")
+    print(f"    🔥5 fwd_o:      variable (ceil(V/BV)*NT*B*H)")
+
+    # 用 cudaProfiler API 标记 ncu 捕获范围
+    torch.cuda.cudart().cudaProfilerStart()
     for i in range(args.iters):
         with torch.no_grad():
             forward_with_nvtx(q, k, v, beta)
         torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+
     print(f"ncu profile done. {args.iters} iterations.")
     print("查看: ncu-ui deltanet_ncu.ncu-rep")
 
