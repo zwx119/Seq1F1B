@@ -29,12 +29,6 @@ print(f"{'='*80}")
 # ============================================================
 # 导入 kernel 函数
 # ============================================================
-from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
-from fla.ops.utils.solve_tril import merge_16x16_to_64x64_inverse_kernel
-from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd_kernel
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_kernel_h
-from fla.ops.common.chunk_o import chunk_fwd_kernel_o
-
 # 准备数据（需要一次 forward 触发 JIT + autotune）
 torch.manual_seed(42)
 q = torch.randn(B, T, H, D, device=device, dtype=dtype)
@@ -124,12 +118,19 @@ print(f"{'='*80}")
 # 尝试获取每个 kernel 的 cache 信息
 import triton
 
+# Import kernel functions by correct names from modules
+import fla.ops.common.chunk_scaled_dot_kkt as _mod_kkt
+import fla.ops.utils.solve_tril as _mod_solve
+import fla.ops.delta_rule.wy_fast as _mod_wy
+import fla.ops.common.chunk_delta_h as _mod_h
+import fla.ops.common.chunk_o as _mod_o
+
 kernels_info = [
-    ("🔥1 kkt (chunk_scaled_dot_kkt_fwd_kernel)", chunk_scaled_dot_kkt_fwd_kernel),
-    ("🔥2 solve_tril (merge_16x16_to_64x64_inverse_kernel)", merge_16x16_to_64x64_inverse_kernel),
-    ("🔥3 recompute_w_u (recompute_w_u_fwd_kernel)", recompute_w_u_fwd_kernel),
-    ("🔥4 chunk_h (chunk_gated_delta_rule_fwd_kernel_h)", chunk_gated_delta_rule_fwd_kernel_h),
-    ("🔥5 chunk_o (chunk_fwd_kernel_o)", chunk_fwd_kernel_o),
+    ("🔥1 kkt", getattr(_mod_kkt, 'chunk_scaled_dot_kkt_fwd_kernel', None)),
+    ("🔥2 solve_tril", getattr(_mod_solve, 'merge_16x16_to_64x64_inverse_kernel', None)),
+    ("🔥3 recompute_w_u", getattr(_mod_wy, 'recompute_w_u_fwd_kernel', None)),
+    ("🔥4 chunk_h", getattr(_mod_h, 'chunk_gated_delta_rule_fwd_kernel_h_blockdim64', None)),
+    ("🔥5 chunk_o", getattr(_mod_o, 'chunk_fwd_kernel_o', None)),
 ]
 
 for name, kernel_fn in kernels_info:
