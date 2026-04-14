@@ -10,25 +10,16 @@ profile_ncu_v2.py — 两阶段 ncu profiling，绕过 Triton JIT 卡死问题
   # 阶段 1: 预热编译缓存（不加 ncu，几秒搞定）
   python profile_ncu_v2.py --warmup-only --T 8192 --B 1
 
-  # 阶段 2: 用 ncu 跑（Triton 从缓存加载，不会卡）
-  ncu --set basic --kernel-name "chunk_gated_delta" --launch-skip 0 --launch-count 1 \
+  # 阶段 2a: 一次抓全部 5 个 kernel（推荐）
+  ncu --replay-mode kernel --set basic \
+    --launch-count 100 -o ncu_all \
+    python profile_ncu_v2.py --target all --T 8192 --B 1
+
+  # 阶段 2b: 也可以只抓某个 kernel
+  ncu --replay-mode kernel --set basic \
+    --kernel-name-base "chunk_gated_delta_rule_fwd_kernel_h" \
+    --launch-skip 0 --launch-count 1 \
     -o ncu_fire4 python profile_ncu_v2.py --target 4 --T 8192 --B 1
-
-  ncu --set basic --kernel-name "merge_16x16_to_64x64" --launch-skip 0 --launch-count 1 \
-    -o ncu_fire2 python profile_ncu_v2.py --target 2 --T 8192 --B 1
-
-  ncu --set basic --kernel-name "chunk_scaled_dot_kkt" --launch-skip 0 --launch-count 1 \
-    -o ncu_fire1 python profile_ncu_v2.py --target 1 --T 8192 --B 1
-
-  ncu --set basic --kernel-name "recompute_w_u" --launch-skip 0 --launch-count 1 \
-    -o ncu_fire3 python profile_ncu_v2.py --target 3 --T 8192 --B 1
-
-  ncu --set basic --kernel-name "chunk_fwd_kernel_o" --launch-skip 0 --launch-count 1 \
-    -o ncu_fire5 python profile_ncu_v2.py --target 5 --T 8192 --B 1
-
-  # 想看更多指标（TC利用率、register spill、stall reason）:
-  ncu --set detailed --kernel-name "chunk_gated_delta" --launch-skip 0 --launch-count 1 \
-    -o ncu_fire4_detail python profile_ncu_v2.py --target 4 --T 8192 --B 1
 """
 
 import argparse
@@ -43,7 +34,7 @@ parser.add_argument("--T", type=int, default=8192)
 parser.add_argument("--H", type=int, default=32)
 parser.add_argument("--D", type=int, default=128)
 parser.add_argument("--target", type=str, default="4",
-                    help="Which kernel to profile: 1,2,3,4,5")
+                    help="Which kernel to profile: 1,2,3,4,5,all")
 parser.add_argument("--warmup-only", action="store_true",
                     help="Only do warmup (compile+cache), then exit. Run this first without ncu.")
 args = parser.parse_args()
@@ -117,7 +108,27 @@ target = args.target
 print(f"Running target 🔥{target} for ncu capture...")
 
 with torch.no_grad():
-    if target == "1":
+    if target == "all":
+        # 按依赖顺序跑全部 5 个 kernel，ncu 一次抓齐
+        print("  🔥1 chunk_scaled_dot_kkt_fwd ...")
+        A2 = chunk_scaled_dot_kkt_fwd(k=k, beta=beta, cu_seqlens=None, chunk_size=64, output_dtype=torch.float32)
+        torch.cuda.synchronize()
+        print("  🔥2 solve_tril ...")
+        A_inv2 = solve_tril(A=A2, cu_seqlens=None, output_dtype=k.dtype)
+        torch.cuda.synchronize()
+        print("  🔥3 recompute_w_u_fwd ...")
+        w2, u2 = recompute_w_u_fwd(k=k, v=v, beta=beta, A=A_inv2, cu_seqlens=None)
+        torch.cuda.synchronize()
+        print("  🔥4 chunk_gated_delta_rule_fwd_h ...")
+        h2, v_new2, _ = chunk_gated_delta_rule_fwd_h(
+            k=k, w=w2, u=u2, g=None, initial_state=None,
+            output_final_state=True, cu_seqlens=None,
+        )
+        torch.cuda.synchronize()
+        print("  🔥5 chunk_fwd_o ...")
+        o2 = chunk_fwd_o(q=q, k=k, v=v_new2, h=h2, g=None, scale=scale, cu_seqlens=None)
+        torch.cuda.synchronize()
+    elif target == "1":
         chunk_scaled_dot_kkt_fwd(k=k, beta=beta, cu_seqlens=None, chunk_size=64, output_dtype=torch.float32)
     elif target == "2":
         solve_tril(A=A, cu_seqlens=None, output_dtype=k.dtype)
