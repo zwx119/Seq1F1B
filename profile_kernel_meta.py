@@ -101,10 +101,7 @@ print(f"{'='*80}")
 for evt in prof.key_averages():
     for kname, label in kernel_names_map.items():
         if kname in evt.key:
-            grid_str = "N/A"
-            block_str = "N/A"
-            # Try to get grid/block from the trace
-            cuda_time = evt.cuda_time_total / 1000  # us -> ms
+            cuda_time = evt.self_cuda_time_total / 1000  # us -> ms
             print(f"{label:<25} {'see below':<20} {'see below':<15} {cuda_time:>10.3f} ms")
             break
 
