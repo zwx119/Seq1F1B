@@ -134,67 +134,66 @@ kernels_info = [
 for name, kernel_fn in kernels_info:
     print(f"\n--- {name} ---")
     
-    # Triton JitFunction has .cache attribute with compiled kernels
-    if hasattr(kernel_fn, 'cache'):
-        for key, compiled in kernel_fn.cache.items():
-            if hasattr(compiled, 'metadata'):
-                meta = compiled.metadata
-                print(f"  Cache key: {key}")
-                n_regs = getattr(meta, 'num_gprs', getattr(meta, 'n_regs', 'N/A'))
-                shared = getattr(meta, 'shared', getattr(meta, 'n_shared_bytes', 'N/A'))
-                n_spills = getattr(meta, 'n_spills', 'N/A')
-                print(f"  Registers:     {n_regs}")
-                print(f"  Shared Memory: {shared} bytes ({shared/1024:.1f} KB)" if isinstance(shared, (int, float)) else f"  Shared Memory: {shared}")
-                print(f"  Spills:        {n_spills}")
-                
-                # Compute theoretical occupancy
-                if isinstance(n_regs, int) and isinstance(shared, int):
-                    # Threads per block (from key or assume 256)
-                    # Triton default: num_warps * 32
-                    num_warps = getattr(meta, 'num_warps', None)
-                    if num_warps is None:
-                        # Try to extract from constexpr key
-                        num_warps = 4  # default guess
-                    threads_per_block = num_warps * 32
-                    
-                    # Register-limited blocks per SM
-                    regs_per_block = n_regs * threads_per_block
-                    if regs_per_block > 0:
-                        blocks_by_regs = MAX_REGS_PER_SM // regs_per_block
-                    else:
-                        blocks_by_regs = MAX_BLOCKS_PER_SM
-                    
-                    # Shared-memory-limited blocks per SM
-                    if shared > 0:
-                        blocks_by_smem = MAX_SHARED_PER_SM // shared
-                    else:
-                        blocks_by_smem = MAX_BLOCKS_PER_SM
-                    
-                    # Thread-limited blocks per SM
-                    blocks_by_threads = MAX_THREADS_PER_SM // threads_per_block
-                    
-                    # Actual blocks per SM
-                    blocks_per_sm = min(blocks_by_regs, blocks_by_smem, blocks_by_threads, MAX_BLOCKS_PER_SM)
-                    occupancy = (blocks_per_sm * threads_per_block) / MAX_THREADS_PER_SM * 100
-                    
-                    print(f"  Num Warps:     {num_warps} ({threads_per_block} threads/block)")
-                    print(f"  Blocks/SM:     {blocks_per_sm} (reg-lim={blocks_by_regs}, smem-lim={blocks_by_smem}, thread-lim={blocks_by_threads})")
-                    print(f"  Occupancy:     {occupancy:.1f}%")
-                    print(f"  Limiting:      {'registers' if blocks_per_sm == blocks_by_regs else 'shared_mem' if blocks_per_sm == blocks_by_smem else 'threads'}")
-                else:
-                    print(f"  (Cannot compute occupancy: regs={n_regs}, shared={shared})")
-            elif hasattr(compiled, 'asm'):
-                # Older Triton: metadata in .asm dict
-                asm = compiled.asm
+    # Unwrap Heuristics/Autotuner to get the actual JitFunction
+    actual_fn = kernel_fn
+    while actual_fn is not None and hasattr(actual_fn, 'fn'):
+        actual_fn = actual_fn.fn
+    
+    if actual_fn is None:
+        print(f"  Kernel not found (None)")
+        continue
+    
+    print(f"  Unwrapped type: {type(actual_fn).__name__}")
+    print(f"  Attributes: {[a for a in dir(actual_fn) if not a.startswith('_') and a not in ('run',)]}")
+    
+    # Try .cache (Triton JitFunction stores compiled kernels here)
+    cache = getattr(actual_fn, 'cache', None)
+    if cache:
+        print(f"  Cache entries: {len(cache)}")
+        for key, compiled in cache.items():
+            print(f"\n  Cache key: {key}")
+            # Print all attributes of compiled object to find metadata
+            comp_attrs = [a for a in dir(compiled) if not a.startswith('_')]
+            print(f"  Compiled type: {type(compiled).__name__}")
+            print(f"  Compiled attrs: {comp_attrs}")
+            
+            # Try various ways to get metadata
+            meta = getattr(compiled, 'metadata', None)
+            if meta:
+                print(f"  Metadata type: {type(meta).__name__}")
+                meta_attrs = {a: getattr(meta, a, '?') for a in dir(meta) if not a.startswith('_')}
+                for k, v in sorted(meta_attrs.items()):
+                    if not callable(v):
+                        print(f"    {k} = {v}")
+            
+            # Try .asm dict
+            asm = getattr(compiled, 'asm', None)
+            if asm and isinstance(asm, dict):
+                print(f"  ASM keys: {list(asm.keys())}")
                 if 'metadata' in asm:
                     print(f"  ASM metadata: {asm['metadata']}")
-            else:
-                print(f"  Compiled object type: {type(compiled)}")
-                print(f"  Attributes: {[a for a in dir(compiled) if not a.startswith('_')]}")
+            
+            # Try n_regs, n_spills, shared directly
+            for attr in ['n_regs', 'num_gprs', 'n_spills', 'shared', 'n_shared_bytes', 'num_warps', 'num_stages']:
+                val = getattr(compiled, attr, None)
+                if val is not None:
+                    print(f"  {attr} = {val}")
+            
+            # Only process first cache entry to keep output manageable
+            break
     else:
-        print(f"  No .cache attribute found")
-        print(f"  Type: {type(kernel_fn)}")
-        print(f"  Attributes: {[a for a in dir(kernel_fn) if not a.startswith('_')]}")
+        print(f"  No cache found on unwrapped fn")
+        # Maybe the cache is elsewhere
+        for attr_name in ['cache', 'kernel_cache', 'compiled_cache']:
+            c = getattr(actual_fn, attr_name, None)
+            if c:
+                print(f"  Found {attr_name}: {type(c)}")
+    
+    # Also check if there's a .best_config from autotuner
+    if hasattr(kernel_fn, 'best_config'):
+        print(f"  Best config: {kernel_fn.best_config}")
+    elif hasattr(kernel_fn, 'configs'):
+        print(f"  Configs: {kernel_fn.configs}")
 
 # ============================================================
 # 方法3: 计算理论 Grid Size
