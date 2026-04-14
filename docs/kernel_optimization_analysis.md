@@ -4,6 +4,8 @@
 
 ## 1. Forward 流水线总览
 
+### 1.1 计算流程
+
 ```
 chunk_delta_rule_fwd(q, k, v, beta):
   ┌─────────────────────────────────────────────────────┐
@@ -18,6 +20,76 @@ chunk_delta_rule_fwd(q, k, v, beta):
   │ Step 3: chunk_fwd_o(q, k, v_new, h)                │
   │   🔥5 chunk_fwd_o   → o [BT×V]                     │  TC dominant
   └─────────────────────────────────────────────────────┘
+```
+
+### 1.2 完整依赖关系图
+
+```
+                        输入: q, k, v, β
+                       ┌──┴──────┴────┴──────┐
+                       │                     │
+                       ▼                     │
+               ┌───────────────┐             │
+               │  🔥1 kkt      │             │
+               │  k, β → A_raw│             │
+               │  [BT×BT]     │             │
+               └──────┬────────┘             │
+                      │ A_raw (HBM)          │
+                      ▼                      │
+               ┌───────────────┐             │
+               │  🔥2 solve    │             │
+               │  A_raw→A_inv  │             │
+               │  [BT×BT]     │             │
+               └──────┬────────┘             │
+                      │ A_inv (HBM)          │
+                      ▼                      │
+               ┌───────────────┐             │
+               │  🔥3 w_u      │             │
+               │  A_inv,k,v,β  │             │
+               │  → w,u        │             │
+               └───┬──────┬────┘             │
+                   │      │                  │
+              w [T,H,K]  u [T,H,V]          │
+                   │      │                  │
+                   ▼      ▼                  │
+               ┌───────────────┐             │
+               │  🔥4 fwd_h    │             │
+               │  k,w,u → h,   │             │
+               │  v_new         │             │
+               │  ⚠️串行 NT步   │             │
+               └───┬──────┬────┘             │
+                   │      │                  │
+              h [NT,H,K,V] v_new [T,H,V]    │
+                   │      │                  │
+                   ▼      ▼                  ▼
+               ┌───────────────────────────────┐
+               │  🔥5 fwd_o                    │
+               │  q, k, v_new, h → o           │
+               │  ✅ 全并行 (NT×B×H×V/BV)      │
+               └──────────┬────────────────────┘
+                          │
+                          ▼
+                      输出: o [B,T,H,V]
+```
+
+**依赖关系总结**:
+```
+🔥1 → 🔥2 → 🔥3 → 🔥4 → 🔥5   (严格串行链)
+│                    │      │
+└── k,β 输入 ────────┘      └── q,k 输入直通 🔥5
+
+数据依赖:
+  🔥1 输出 A_raw    → 🔥2 输入
+  🔥2 输出 A_inv    → 🔥3 输入
+  🔥3 输出 w, u     → 🔥4 输入
+  🔥4 输出 h, v_new → 🔥5 输入
+  q, k             → 🔥5 直接输入 (不经过 🔥1-🔥4)
+
+可融合范围:
+  ✅ 🔥1+🔥2+🔥3: 同 Grid (NT, B×H)，A 在寄存器中传递
+  ✅ 🔥4+🔥5: Producer-Consumer，h/v_new 在 SRAM 中传递
+  ❌ 🔥3+🔥4: Grid 不同 (🔥3 按 chunk 并行, 🔥4 串行递推)
+  ❌ 🔥1-🔥5 全融合: 🔥4 的串行递推阻断了流水线
 ```
 
 ---
@@ -201,7 +273,7 @@ b_o = b_o * scale + tl.dot(b_A, b_v) * scale   # [BT,BT]@[BT,BV] ← TC + CC
 
 ## 3. 实测耗时数据
 
-### 3.1 实测结果 (B=2, T=8192, H=32, D=128, A100)
+### 3.1 torch.profiler 结果 (B=2, T=8192, H=32, D=128, A100)
 
 ```
 python profile_nsys_ncu.py --mode torch --T 8192
@@ -217,7 +289,52 @@ python profile_nsys_ncu.py --mode torch --T 8192
 | 其他 (zeros/fill) | 0.384ms | 1.65% | — |
 | **总计** | **11.673ms** | | |
 
-### 3.2 Latency Scaling (B=1, H=32, D=128)
+### 3.2 nsys 结果 (B=1, T=32768, H=32, D=128, A100)
+
+```
+nsys profile --trace=cuda,nvtx --output=deltanet_nsys_32k \
+  python profile_nsys_ncu.py --mode nsys --T 32768 --B 1 --iters 3
+```
+
+**CUDA GPU Kernel Summary** (3 iterations, 真正的 GPU 耗时):
+
+| Kernel | GPU 总耗时 | 占比 | Instances | 平均每次 | 备注 |
+|--------|-----------|------|-----------|---------|------|
+| 🔥1 `chunk_scaled_dot_kkt_fwd_kernel` | 2,382ms | **30.2%** | 6,660 | 358μs | ⚠️ 占比大幅上升！ |
+| 🔥4 `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` | 1,555ms | **19.7%** | 793 | 1,961μs | 每次最慢 |
+| 🔥2 `merge_16x16_to_64x64_inverse_kernel` | 1,466ms | **18.6%** | 1,017 | 1,441μs | |
+| 🔥3 `recompute_w_u_fwd_kernel` | 995ms | **12.6%** | 1,202 | 828μs | |
+| 🔥5 `chunk_fwd_kernel_o` | 359ms | **4.6%** | 307 | 1,168μs | ⚠️ 占比大幅下降！ |
+| elementwise (zeros/fill/...) | 1,116ms | **14.2%** | 7,988 | 140μs | overhead |
+
+> ⚠️ **nsys vs torch.profiler 数据差异巨大！**
+> - 🔥1: 6.4% → 30.2% (↑5×)
+> - 🔥5: 24.3% → 4.6% (↓5×)
+> 
+> **原因分析**: nsys 统计了 **3 次迭代 + warmup 中 autotune 的所有 kernel launch**:
+> - 🔥1 有 6,660 instances（期望 = 3×NT×B×H = 3×512×1×32 = 49,152？不对）
+> - 实际 6,660 ÷ 3 = 2,220 per iter，但期望 512×32 = 16,384 — 说明 nsys 捕获范围不同
+> - 🔥5 只有 307 instances — 可能 autotune 候选配置较少
+>
+> **结论**: nsys 的 instance count 混入了 autotune trial runs。
+> **以 torch.profiler (3.1) 的占比为准**，nsys 用于看 timeline 和 kernel overlap。
+
+**NVTX Range Summary** (Host-side, 包含 launch overhead):
+
+| NVTX Range | Host 总时间 | 占比 | 说明 |
+|------------|-----------|------|------|
+| 🔥1 chunk_scaled_dot_kkt | 6,800ms | 46.9% | 包含 autotune 编译时间 |
+| 🔥2 solve_tril | 2,551ms | 17.6% | |
+| 🔥4 chunk_fwd_h | 2,529ms | 17.4% | |
+| 🔥3 recompute_w_u | 1,996ms | 13.8% | |
+| 🔥5 chunk_fwd_o | 620ms | 4.3% | |
+| forward (总) | 2.1ms | — | 3 次迭代各 ~663μs host 时间 |
+
+> 注: NVTX 时间 = CPU host 时间 (push/pop)，含 kernel launch + CUDA async。
+> 🔥1 的 46.9% 是因为 autotune 在 warmup 时触发了大量试跑。
+> NVTX 不代表 GPU 实际执行占比，看 GPU Kernel Summary 为准。
+
+### 3.3 Latency Scaling (B=1, H=32, D=128)
 
 ```
 T= 1024 (NT= 16) | fwd = 0.62 ms
@@ -230,7 +347,7 @@ T=32768 (NT=512) | fwd = 5.16 ms  ← ~2×, 线性确认
 
 从 T=8192 开始，每翻倍 T → latency 翻倍，确认 🔥4 串行递推是随 T 线性增长的主导项。
 
-### 3.3 关键发现
+### 3.4 关键发现
 
 **🔥2 solve_tril 占了 24%，远超理论预估 (~8%)！**
 
@@ -242,8 +359,74 @@ T=32768 (NT=512) | fwd = 5.16 ms  ← ~2×, 线性确认
 
 **前三大瓶颈几乎三足鼎立：🔥4 (28%) ≈ 🔥2 (24%) ≈ 🔥5 (24%)**
 
-> 注：在 T=32K 时，🔥4 占比会上升（因为串行步数 NT=512），🔥2/🔥5 占比相对下降。
-> 需要在 T=32K 条件下再做一次 profile 确认。
+### 3.5 ncu 详细分析
+
+nsys 给出全局 timeline 和占比，**ncu (Nsight Compute)** 则给出单个 kernel 的微架构细节:
+寄存器使用、shared memory、TC/CC 利用率、内存带宽、pipeline stall 原因等。
+
+**ncu 命令** (在 GPU 机器上执行):
+
+```bash
+# 分析 🔥4 (最慢的单次 kernel, 串行递推)
+ncu --set full \
+    --kernel-name "chunk_gated_delta" \
+    --launch-skip 3 --launch-count 1 \
+    -o deltanet_ncu_fire4 \
+    python profile_nsys_ncu.py --mode ncu --T 8192 --B 1 --iters 1
+
+# 分析 🔥2 (延迟瓶颈, FLOPs 极小但耗时极高)
+ncu --set full \
+    --kernel-name "merge_16x16_to_64x64" \
+    --launch-skip 3 --launch-count 1 \
+    -o deltanet_ncu_fire2 \
+    python profile_nsys_ncu.py --mode ncu --T 8192 --B 1 --iters 1
+
+# 分析 🔥1 (看 TC 利用率和 autotune 最优配置)
+ncu --set full \
+    --kernel-name "chunk_scaled_dot_kkt" \
+    --launch-skip 3 --launch-count 1 \
+    -o deltanet_ncu_fire1 \
+    python profile_nsys_ncu.py --mode ncu --T 8192 --B 1 --iters 1
+
+# 分析 🔥3 (看 allow_tf32=False 的实际影响)
+ncu --set full \
+    --kernel-name "recompute_w_u" \
+    --launch-skip 3 --launch-count 1 \
+    -o deltanet_ncu_fire3 \
+    python profile_nsys_ncu.py --mode ncu --T 8192 --B 1 --iters 1
+
+# 分析 🔥5 (baseline，看 TC 利用率天花板)
+ncu --set full \
+    --kernel-name "chunk_fwd_kernel_o" \
+    --launch-skip 3 --launch-count 1 \
+    -o deltanet_ncu_fire5 \
+    python profile_nsys_ncu.py --mode ncu --T 8192 --B 1 --iters 1
+```
+
+**查看 ncu 结果**:
+```bash
+# 终端快速查看
+ncu --import deltanet_ncu_fire4.ncu-rep --page raw
+
+# 可视化 (如果有 GUI)
+ncu-ui deltanet_ncu_fire4.ncu-rep
+```
+
+**ncu 重点关注指标**:
+| 指标 | 含义 | 看哪个 kernel |
+|------|------|-------------|
+| `sm__throughput.avg.pct_of_peak_sustained` | SM 整体利用率 | 🔥4 (串行) |
+| `sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained` | TC 利用率 | 🔥3 (tf32?), 🔥5 (baseline) |
+| `sm__sass_thread_inst_executed_op_fp32_pred_on.avg.pct_of_peak_sustained` | FP32 CUDA Core | 🔥2, 🔥3 |
+| `l1tex__throughput.avg.pct_of_peak_sustained` | L1/共享内存带宽 | 🔥2 (小 tile) |
+| `dram__throughput.avg.pct_of_peak_sustained` | HBM 带宽利用率 | 🔥1, 🔥4 |
+| `launch__registers_per_thread` | 每线程寄存器数 | 🔥4 (寄存器压力) |
+| `launch__occupancy` | SM 占用率 | 🔥4 (CTA 不足?) |
+| `sm__warps_active.avg.pct_of_peak_sustained` | warp 活跃率 | 所有 kernel |
+| `smsp__inst_executed_pipe_tensor.avg.pct_of_peak_sustained` | TC pipe 利用率 | 🔥3 vs 🔥5 对比 |
+
+> 建议优先跑 🔥4 和 🔥2 的 ncu，因为它们分别是串行瓶颈和延迟瓶颈，
+> ncu 数据能直接指导 P0 融合和 P2 占用率优化的实施方案。
 
 ---
 
