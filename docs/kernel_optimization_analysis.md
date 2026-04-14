@@ -247,161 +247,254 @@ T=32768 (NT=512) | fwd = 5.16 ms  ← ~2×, 线性确认
 
 ---
 
-## 4. 优化策略建议
+## 4. 优化策略（按优先级排列）
 
-### 优先级 P0: 🔥2 solve_tril + 🔥4 chunk_fwd_h (共占 52%)
+> 目标硬件：A100-80GB (108 SMs)、H100 (132 SMs, warp specialization, TMA)、H20
+> 实测占比 (T=8K): 🔥4(28%) ≈ 🔥2(24%) ≈ 🔥5(24%) > 🔥3(15%) > 🔥1(6%)
 
-#### P0a: 🔥2 solve_tril (24%) — 意外的大瓶颈
+### P0：🔥1+🔥2+🔥3 融合 — 最大收益 (合占 46%)
 
-**问题**: FLOPs 很小但耗时很高，纯 latency bound。
-- 4 个 16×16 对角块各自 14-step 串行 for-loop
-- 合并阶段 10 次 16×16 dot，太小无法充分利用 TC
-- 每次调用 568μs，占总耗时 24%
+**现状**: 3 个独立 kernel，中间通过 HBM 传递 A `[B,T,H,BT]`
 
-**策略**:
-1. **融合到 🔥1+🔥3 中** — 避免单独 kernel launch + HBM 读写 A
-2. **考虑近似替代** — 截断 Neumann 级数 $(I+A)^{-1} \approx I - A + A^2 - A^3$
-   只需几次矩阵乘，全部在 TC 上跑，但会引入近似误差
-3. **增大子块** — 从 16×16 改为 32×32 基础块，减少合并层数
+```
+🔥1: k,β → A_raw [BT×BT]  ──HBM写──→  🔥2: A_raw → A_inv [BT×BT]  ──HBM写──→  🔥3: A_inv,k,v,β → w,u
+                            ←──HBM读──                               ←──HBM读──
+```
 
-#### P0b: 🔥4 chunk_fwd_h (28%) — 串行递推
+**融合后**: A 始终在寄存器/SRAM 中，省掉所有中间 HBM 往返
 
-**问题**: NT=512 步串行，每步做 4 个 `tl.dot`，受寄存器大小限制只能在 1 个 CTA 上跑。
-在 T=32K 时占比会进一步上升。
+```
+fused_wy_repr_kernel: k,v,β → w,u   (A 在寄存器中生产+消费，不写 HBM)
+```
 
-**策略 A: 增大 BT (chunk size)**
-- 当前 BT=64 → 可尝试 BT=128 或 BT=256
-- NT 减半/减四，串行步数减少
-- 代价: 🔥2 solve_tril 复杂度从 O(BT^2) 变 O(BT^3)，寄存器压力增大
-- **可行性**: ⭐⭐⭐ 需修改多处 BT 硬编码
+**收益分析**:
+- **省掉 A 的 4× HBM 传输**: A 大小 = B×NT×H×BT×BT×4B
+  - T=8K, B=2, H=32: 2×128×32×64×64×4 = **2 GB** 总带宽节省
+  - T=32K, B=1, H=32: 1×512×32×64×64×4 = **4 GB** 总带宽节省
+- **减少 2 次 kernel launch overhead**: ~5-10μs each
+- **🔥2 的 CC 串行延迟被隐藏**: 编译器可在 🔥2 串行求逆期间 prefetch 🔥3 需要的 v, k 数据
+- A `[64×64]` FP32 = 16KB，放寄存器可行（4096 个 float32 寄存器）
 
-**策略 B: Chunk 级并行递推 (Parallel Prefix Sum / Scan)**
-- 将 h_t = decay(h_{t-1}) + k_t^T @ u_t 改写为 parallel scan
-- DeltaNet 的 decay 矩阵是 (I - βkk^T)，不是简单标量 decay，parallel scan 需要矩阵乘法
-- 状态 S ∈ R^{K×V}，scan 操作 = 矩阵乘，复杂度 O(K^2×V) per step
-- **可行性**: ⭐⭐ 理论可行但工程难度大
-
-**策略 C: 流水线化 w@h 和 k^T@v 的 TC 操作**
-- 当前同一 CTA 内顺序做 `b_v -= dot(w, h)` 然后 `b_h += dot(k, v)`
-- 利用 Triton 的 `num_stages` 和 software pipelining 重叠内存访问
-- **可行性**: ⭐⭐⭐⭐ 通过 autotune num_stages 已部分实现
-
-**策略 D: Warp Specialization (CUTLASS-style)**
-- 将 w@h (修正) 和 k^T@v (更新) 分配给不同 warp
-- 需要 warp-level 同步 (shared memory 传递 b_v)
-- Triton 暂不支持显式 warp specialization
-- **可行性**: ⭐ 需要手写 CUDA kernel
-
-### 优先级 P1: 🔥1+🔥2+🔥3 融合 (共占 46%)
-
-**当前**: 3 个独立 kernel launch，中间通过 HBM 传递 A [B,T,H,BT]
-**实测**: 🔥1(6%) + 🔥2(24%) + 🔥3(15%) = 46%，接近一半！
-
-**优化**: 将 kkt → solve → w_u 融合为 1 个 kernel
-- kkt 生成 A 后直接在 SRAM 中做 solve，再直接做 w_u
-- 省掉 A 写回 HBM 和重新读取的带宽开销
-- A 的大小: B×T×H×BT×4B = 1×32K×32×64×4 ≈ 256MB (BT=64, fp32)
+**预期提升**: 当前 46% 的部分节省 30-50% → **总体加速 14-23%**
 
 **实现思路**:
 ```python
 @triton.jit
 def fused_wy_repr_kernel(k, v, beta, w, u, ...):
-    # Phase 1: compute A = β·kk^T (🔥1)
-    b_A = zeros([BT, BT])
-    for i_k in range(cdiv(K, BK)):
-        b_k = load(k, [BT, BK])
-        b_A += tl.dot(b_k, tl.trans(b_k))
-    b_A *= b_beta[:, None]
-    b_A = where(lower_tri, b_A, 0)
-    
-    # Phase 2: solve (I+A)^{-1} (🔥2) — 直接在寄存器/SRAM 中
-    # ... forward substitution in registers ...
-    
-    # Phase 3: compute w, u (🔥3) — 用寄存器中的 A
-    for i_v in range(cdiv(V, BV)):
-        b_vb = load(v) * b_beta[:, None]
-        b_u = tl.dot(b_A, b_vb)
-        store(u, b_u)
-    for i_k in range(cdiv(K, BK)):
-        b_kb = load(k) * b_beta[:, None]
-        b_w = tl.dot(b_A, b_kb)
-        store(w, b_w)
+    # ═══ Phase 1: 🔥1 — 计算 A_raw = β·(k·k^T) 的下三角 ═══
+    b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        b_k = tl.load(p_k, ...)                   # [BT, BK] from HBM
+        b_A += tl.dot(b_k, tl.trans(b_k))         # TC
+    b_A *= b_beta[:, None]                         # CC
+    b_A = tl.where(lower_tri_mask, b_A, 0)         # CC
+    # 🔑 A_raw 在寄存器中，不写回 HBM！
+
+    # ═══ Phase 2: 🔥2 — 原地求逆 (I+A)^{-1} ═══
+    # 4 个 16×16 对角块各自 forward substitution (CC, 14-step 串行)
+    # 然后用 ~10 次 16×16 dot 合并成 64×64 (TC, 小 tile)
+    # 🔑 A_inv 还是在寄存器中！
+
+    # ═══ Phase 3: 🔥3 — 计算 w, u ═══
+    for i_v in range(tl.cdiv(V, BV)):
+        b_v = tl.load(p_v, ...)                    # [BT, BV] from HBM
+        b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)  # CC
+        b_u = tl.dot(b_A_inv, b_vb, allow_tf32=False) # TC/CC
+        tl.store(p_u, b_u, ...)                     # to HBM
+    for i_k in range(tl.cdiv(K, BK)):
+        b_k = tl.load(p_k, ...)                    # [BT, BK] from HBM
+        b_kb = (b_k * b_beta[:, None]).to(b_k.dtype)  # CC
+        b_w = tl.dot(b_A_inv, b_kb, allow_tf32=False) # TC/CC
+        tl.store(p_w, b_w, ...)                     # to HBM
 ```
 
-**收益**: 
-- 省掉 A 的 2× HBM 读写 (256MB × 2 = 512MB bandwidth)
-- 减少 2 次 kernel launch overhead (约 5-10μs each)
-- A [BT×BT] = 64×64×4B = 16KB 可以放在 shared memory
+**Grid**: `(NT, B×H)` — 与原 🔥1/🔥2/🔥3 相同
 
-**可行性**: ⭐⭐⭐⭐ 高 — 推荐第一个动手
+**寄存器压力**:
+- b_A / b_A_inv: [64×64] FP32 = 4096 reg (或拆成 4 个 [16×16] 对角块 + 6 个 off-diagonal)
+- b_k tile: [64×BK] = 最多 4096 reg
+- b_v tile: [64×BV] = 最多 4096 reg
+- A100: 65536 regs/SM, 4 warps(128 threads) → 512 regs/thread，需谨慎调配
 
-### 优先级 P2: 🔥4+🔥5 融合 (Inter-chunk overlap)
-
-**思路**: chunk_fwd_h 产出 h[i_t] 后，chunk_fwd_o 可以立即使用 h[i_t] 计算 o[i_t]。
-
-当前是分开的两个 kernel，🔥4 全部完成后才启动 🔥5。
-
-**Producer-Consumer 模式**:
-- 🔥4 的一个 CTA 串行生成 h[0], h[1], ..., h[NT-1]
-- 🔥5 的多个 CTA 并行消费 h[i_t]
-- 用 atomicAdd 或 global memory flag 做同步
-
-**实现**:
-```python
-# 🔥4 CTA: 每生成一个 h[i_t]，signal flag
-for i_t in range(NT):
-    store(h[i_t], b_h)
-    tl.atomic_xchg(ready_flag + i_t, 1)  # signal 🔥5
-    # continue to compute h[i_t+1]...
-
-# 🔥5 CTA: spin-wait on flag
-while tl.atomic_cas(ready_flag + i_t, 1, 1) != 1:
-    pass  # spin
-b_h = load(h[i_t])
-# compute output...
-```
-
-**挑战**: Triton 对 global memory synchronization 支持有限
-**可行性**: ⭐⭐ 需要 CUDA 层面实现
-
-### 优先级 P3: 精度策略优化
-
-**🔥3 recompute_w_u 中 `allow_tf32=False`**:
-- 当前强制 FP32 精度，TC 效率只有 BF16 的 1/16
-- 考虑: 在 A 已经是 FP32 的情况下，dot(A, v_beta) 的精度需求是否真的需要 IEEE FP32?
-- 替代: 用 `allow_tf32=True` 配合 FP32 accumulator (Triton 默认)
-- 或者: 将 A cast 到 BF16 后再 dot (如果数值稳定)
+**实施步骤**:
+1. 先实现融合 kernel，`allow_tf32` 设置与原 🔥3 保持一致 (`False`)
+2. 用 `prepare_wy_repr_fwd` 的原始输出做 correctness 对比
+3. ncu profile 检查 register spill 和 SM occupancy
+4. autotune num_warps, num_stages, BK
 
 ---
 
-## 5. 推荐行动路线 (基于实测数据修正)
+### P1：🔥3 精度优化 `allow_tf32=True`
+
+**现状**: `recompute_w_u_fwd_kernel` 中 `tl.dot(b_A, b_vb, allow_tf32=False)`
+- 强制 FP32 精度（CUDA Core），A100 上仅 19.5 TFLOPS
+- 如果改为 `allow_tf32=True`，可用 TF32 Tensor Core (156 TFLOPS)，**8× 理论加速**
+
+**风险**: TF32 有效尾数 10 bit (vs FP32 的 23 bit)
+- A 矩阵是 `(I + β·KK^T)^{-1}` 的逆，数值敏感
+- 需要端到端训练测试验证收敛性
+
+**实施**: 改一行代码 + 跑收敛测试
+- 如果 🔥1+🔥2+🔥3 已融合，直接在融合 kernel 中测试
+- 可作为 autotune 参数之一：`DOT_PRECISION: tl.constexpr` → 让 Triton 自动选
+
+---
+
+### P2：🔥4 chunk_fwd_h 提升占用率 (28%)
+
+**问题**:
+- Grid = `(ceil(V/BV), B×H)` — CTA 数不含 NT，NT 是 CTA 内串行 for-loop
+- 小模型 (H=16) CTA 数严重不足：
+
+| 模型 | H | V=D | BV=32 CTA数 | BV=64 CTA数 | vs 108 SMs |
+|------|---|-----|------------|------------|------------|
+| 1.3B | 16 | 128 | 64 | 32 | ❌ 都不够 |
+| 2.7B | 32 | 80 | 96 | 64 | ❌ 都不够 |
+| 7B | 32 | 128 | 128 | 64 | BV=32 ✅ |
+| 13B | 40 | 128 | 160 | 80 | BV=32 ✅ |
+| 30B | 64 | 96 | 192 | 128 | 两者 ✅ |
+
+> BV 在 A100 上由 `@triton.autotune` 从 [32, 64] 中自动选择
+> （`check_shared_mem('ada')` = True on A100，所以 BV 候选 = [32, 64]）
+> BV 设置位置: `fla/ops/common/chunk_delta_h.py` 第 29 行
+
+**策略 A: 增大 BT (64→128)**
+- NT 减半，串行步数减少
+- 代价: 🔥2 solve_tril 从 O(BT²) → O(BT³)，寄存器压力 ×4
+- 可行性: ⭐⭐⭐ 需修改多处 BT=64 硬编码
+
+**策略 B: split-K**
+- 把 K 维度拆到 Grid 上: Grid = `(ceil(V/BV), ceil(K/64), B×H)`
+- 每个 CTA 只负责一个 K-block 的累积
+- 需要 atomic 或 reduction 合并结果
+- 可行性: ⭐⭐ 增加同步开销
+
+**策略 C: 🔥4+🔥5 Producer-Consumer 融合** (见下文 P3)
+
+---
+
+### P3：🔥4+🔥5 融合 — Producer-Consumer 模式 (合占 52%)
+
+**动机**: 🔥4 串行产出 h[0], h[1], ..., h[NT-1]，🔥5 等 🔥4 全部完成才开始。
+实际上 🔥5 处理 chunk i_t 只需要 `h[i_t]` 和 `v_new[i_t]`，不需要等后面的 chunk。
+
+**数据依赖分析**:
+```
+🔥4 CTA (串行):  h[0] → h[1] → h[2] → ... → h[NT-1]
+                   ↓      ↓      ↓              ↓
+🔥5 CTA (并行):  o[0]   o[1]   o[2]   ...    o[NT-1]
+```
+
+🔥5 处理 chunk t 需要: `q[t]`, `k[t]`, `v_new[t]`, `h[t]` — 前三个已知，`h[t]` 由🔥4 逐步产出。
+
+**实现方案 1: Global Memory Flag (Triton 可行)**
+```python
+# 🔥4 CTA: 产出 h[i_t] 后 signal
+for i_t in range(NT):
+    tl.store(h[i_t], b_h)
+    tl.store(v_new[i_t], b_v_new)
+    tl.debug_barrier()                         # 确保写入完成
+    tl.atomic_xchg(ready_flag + i_t, 1)        # signal: h[i_t] ready
+
+# 🔥5 CTA: spin-wait on flag
+while tl.load(ready_flag + my_i_t) == 0:
+    pass  # spin
+b_h = tl.load(h[my_i_t])
+# ... 计算 o[my_i_t] ...
+```
+
+**实现方案 2: Warp Specialization (H100/H20, CUDA)**
+```
+CTA 内部:
+  Warp Group 0 (producer): 运行🔥4 递推，产出 h → shared memory
+  Warp Group 1 (consumer): 运行🔥5 输出计算，从 shared memory 读 h
+
+  用 shared memory barrier / arrive-wait 同步
+```
+
+H100 的 warp specialization 支持让 producer/consumer warp 在同一 CTA 内高效协作。
+**这是 H100 相比 A100 的核心架构优势之一。**
+
+**收益**:
+- 🔥4 和 🔥5 的延迟完全重叠（理想情况下 max(🔥4, 🔥5) 而非 🔥4 + 🔥5）
+- 减少 1 次 kernel launch
+- h 不需要写 HBM → 直接在 SRAM 中传递（省 h 的 HBM 带宽）
+  - h 大小 = B×NT×H×K×V×2B = 2×128×32×128×128×2 ≈ **4 GB** for T=8K
+
+**挑战**:
+- 方案 1: GPU 上 spin-wait 浪费算力，且 Triton 的 atomic 支持有限
+- 方案 2: 需要手写 CUDA kernel（CUTLASS 3.x 风格），工程量大
+- 🔥5 的 CTA 远多于 🔥4（🔥5 有 NT 维度在 Grid 中），调度不匹配
+
+**可行性**: ⭐⭐ (A100) / ⭐⭐⭐⭐ (H100/H20 with warp specialization)
+
+---
+
+### P4：🔥2 算法改进（如果不走融合路线的备选）
+
+**Neumann 级数近似**:
+$(I+A)^{-1} \approx I - A + A^2 - A^3 + ...$
+- 只需几次 [64×64] 矩阵乘，全部跑 TC
+- 截断到 k 阶: k 次 `tl.dot`，复杂度 O(k×BT³)
+- 但 A 的谱半径可能 >1，级数不保证收敛 → **数值风险**
+
+**分块 LU 分解**:
+- 将 64×64 分成 2 个 32×32 块，递归求逆
+- 减少串行步数（14→6），但增加矩阵乘次数
+- 可行性: ⭐⭐⭐ 如果融合方案寄存器不够，这是降级方案
+
+---
+
+### P5：全局 BT (chunk_size) 调优
+
+当前 BT=64 硬编码在多处。增大 BT 的影响:
+
+| BT | NT (T=32K) | 🔥4 串行步数 | 🔥2 复杂度 | A 的大小 | 寄存器压力 |
+|----|-----------|------------|----------|---------|----------|
+| 64 | 512 | 512 | O(64³) ≈ 262K | 16 KB | 适中 |
+| 128 | 256 | 256 (↓50%) | O(128³) ≈ 2M (↑8×) | 64 KB | 极高 |
+| 256 | 128 | 128 (↓75%) | O(256³) ≈ 16M (↑64×) | 256 KB | 不可行 |
+
+BT=128 是潜在 sweet spot：🔥4 加速 2× 但 🔥2 增 8×。
+**如果 🔥1+🔥2+🔥3 已融合且 🔥2 延迟被隐藏，BT=128 更可行。**
+
+---
+
+## 5. 推荐行动路线
 
 ```
 Phase 2.1: ✅ Profile (已完成)
-  └─ 实测 T=8192: 🔥4(28%) ≈ 🔥2(24%) ≈ 🔥5(24%) > 🔥3(15%) > 🔥1(6%)
+  └─ 实测数据: 🔥4(28%) ≈ 🔥2(24%) ≈ 🔥5(24%) > 🔥3(15%) > 🔥1(6%)
+  └─ T=32K 补充 profile 已完成: 占比稳定，全部线性 scaling
 
-Phase 2.1b: 补充 Profile — T=32K (1 天)
-  └─ 在 T=32K 下重新 profile，确认 🔥4 在长序列下的占比上升趋势
+Phase 2.2: 🔥1+🔥2+🔥3 Fusion (3-5 天) ← 最推荐先做，最大收益
+  ├─ 实现 fused_wy_repr_kernel (kkt → solve → w_u 单 kernel)
+  ├─ A [64×64] 留在寄存器/SRAM，省掉 HBM 读写
+  ├─ 三者合占 46%，融合后预期省 30-50% → 总体加速 14-23%
+  ├─ 在融合 kernel 中同步测试 allow_tf32=True (P1)
+  └─ 正确性测试 + ncu profile
 
-Phase 2.2: 🔥1+🔥2+🔥3 Fusion (3-5 天) ← 最推荐先做
-  ├─ 实现 fused_wy_repr_kernel (kkt → solve → w_u 融合)
-  ├─ A [64×64] 留在 SRAM，省掉 HBM 读写
-  ├─ 三者合占 46%，融合后预期省 30-50% 的这部分开销
-  └─ 单元测试 + 端到端性能对比
+Phase 2.3: 🔥4 提升占用率 (1 周)
+  ├─ 优化 BV autotune 策略（强制 BV=32 for 小 H 模型）
+  ├─ 测试 BT=128 对端到端的影响
+  └─ A100 + H100/H20 上分别测试
 
-Phase 2.3: 🔥4 加速 (1-2 周)
-  ├─ 方案 A: 增大 BT (BT=128) → 减少串行步数 NT
-  ├─ 方案 C: 优化 num_stages/num_warps autotune 范围
-  └─ 方案 B: 研究 parallel scan 的可行性
+Phase 2.4: 🔥4+🔥5 Producer-Consumer 融合 (2-3 周)
+  ├─ 先在 Triton 中用 global memory flag 做原型
+  ├─ 如果效果好，在 H100 上用 warp specialization 做高效实现
+  └─ 省掉 h 的 HBM 往返 (4GB @T=8K)
 
-Phase 2.4: Precision Tuning (2-3 天)
-  ├─ 测试 🔥3 allow_tf32=True 对收敛的影响
-  └─ 混合精度策略
+Phase 2.5: 端到端训练验证 (持续)
+  ├─ 确认融合 kernel 的数值精度
+  ├─ allow_tf32 收敛性验证
+  └─ 在 Seq1F1B pipeline 中做 throughput 测试
 ```
 
 ---
 
-## 6. 附录：A100 硬件参数快速参考
+## 6. 附录：硬件参数快速参考
+
+### A100-80GB SXM
 
 | 资源 | 数值 |
 |------|------|
@@ -414,4 +507,45 @@ Phase 2.4: Precision Tuning (2-3 天)
 | HBM2e 带宽 | 2039 GB/s |
 | L2 Cache | 40 MB |
 | Shared Memory / SM | 164 KB (最大配置) |
-| 寄存器文件 / SM | 256 KB |
+| 寄存器文件 / SM | 256 KB (65536 × 32-bit) |
+| Warp Specialization | ❌ 不支持 |
+| TMA | ❌ 不支持 |
+
+### H100-80GB SXM
+
+| 资源 | 数值 |
+|------|------|
+| SMs | 132 |
+| Tensor Cores / SM | 4 (4th gen) |
+| BF16 TC 峰值 | 990 TFLOPS |
+| FP32 TC (TF32) | 495 TFLOPS |
+| FP32 CUDA Core | 67 TFLOPS |
+| HBM3 带宽 | 3350 GB/s |
+| L2 Cache | 50 MB |
+| Shared Memory / SM | 228 KB (最大配置) |
+| 寄存器文件 / SM | 256 KB (65536 × 32-bit) |
+| Warp Specialization | ✅ **支持** — producer/consumer warp 协作 |
+| TMA (Tensor Memory Accelerator) | ✅ **支持** — 异步块拷贝 |
+
+### H20
+
+| 资源 | 数值 |
+|------|------|
+| SMs | 132 |
+| BF16 TC 峰值 | 148 TFLOPS |
+| FP32 TC (TF32) | 74 TFLOPS |
+| HBM3 带宽 | 4000 GB/s |
+| L2 Cache | 60 MB |
+| Shared Memory / SM | 228 KB |
+| Warp Specialization | ✅ 支持 (Hopper 架构) |
+| TMA | ✅ 支持 |
+| 特点 | 算力弱但带宽极高 → **更受 compute bound 影响** |
+
+### 🔥4+🔥5 融合在不同硬件上的策略选择
+
+| 方案 | A100 | H100 | H20 |
+|------|------|------|-----|
+| Global Memory Flag (Triton) | ⭐⭐ spin-wait 浪费 SM | ⭐⭐ 同上 | ⭐⭐ 同上 |
+| Warp Specialization (CUDA) | ❌ 不支持 | ⭐⭐⭐⭐ **最佳** | ⭐⭐⭐⭐ 支持 |
+| Persistent Kernel + TMA | ❌ | ⭐⭐⭐⭐ TMA 异步加载 | ⭐⭐⭐⭐ |
+| 分开执行 (现状) | 🔵 baseline | 🔵 baseline | 🔵 baseline |
