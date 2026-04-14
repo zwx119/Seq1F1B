@@ -95,15 +95,16 @@ kernel_names_map = {
 }
 
 print(f"\n{'='*80}")
-print(f"{'Kernel':<25} {'Grid':<20} {'Block':<15} {'CUDA Time':>12}")
+print(f"{'Kernel':<25} {'CUDA Time':>12}")
 print(f"{'='*80}")
 
-for evt in prof.key_averages():
-    for kname, label in kernel_names_map.items():
-        if kname in evt.key:
-            cuda_time = evt.self_cuda_time_total / 1000  # us -> ms
-            print(f"{label:<25} {'see below':<20} {'see below':<15} {cuda_time:>10.3f} ms")
-            break
+for evt in prof.events():
+    if evt.device_type == torch.autograd.DeviceType.CUDA:
+        for kname, label in kernel_names_map.items():
+            if kname in evt.name:
+                cuda_time = evt.cuda_time / 1000  # us -> ms
+                print(f"{label:<25} {cuda_time:>10.3f} ms")
+                break
 
 # ============================================================
 # 方法2: 直接从 Triton kernel 对象获取编译元数据
