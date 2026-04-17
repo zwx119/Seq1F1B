@@ -12,12 +12,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 GPUS=${GPUS_PER_NODE:-4}
 PP_SP=${PP_SP:-1}
 PP_SP_STR=${PP_SP_STR:-average}
-SEQ_LEN=${SEQ_LEN:-1024}
-NUM_LAYERS=${NUM_LAYERS:-8}
-HIDDEN=${HIDDEN:-256}
-NUM_HEADS=${NUM_HEADS:-4}
+SEQ_LEN=${SEQ_LEN:-8192}
+NUM_LAYERS=${NUM_LAYERS:-24}
+HIDDEN=${HIDDEN:-1024}
+NUM_HEADS=${NUM_HEADS:-16}
 MICRO_BATCH=${MICRO_BATCH:-1}
-TRAIN_ITER=${TRAIN_ITER:-4}
+GLOBAL_BATCH=${GLOBAL_BATCH:-4}
+TRAIN_ITER=${TRAIN_ITER:-10}
 
 # We need data-path for Megatron's arg parser even though we use synthetic data.
 # Point to actual data or create a dummy.
@@ -45,9 +46,10 @@ options=" \
     --seq-length ${SEQ_LEN} \
     --max-position-embeddings ${SEQ_LEN} \
     --micro-batch-size ${MICRO_BATCH} \
-    --global-batch-size ${MICRO_BATCH} \
-    --lr 0.0 \
-    --min-lr 0.0 \
+    --global-batch-size ${GLOBAL_BATCH} \
+    --lr 6.0e-4 \
+    --min-lr 6.0e-5 \
+    --lr-decay-style cosine \
     --train-iters ${TRAIN_ITER} \
     --log-interval 1 \
     --eval-iters 0 \
@@ -67,6 +69,13 @@ options=" \
     --seed 42 \
     --no-save-optim \
     --no-save-rng \
+    --clip-grad 1.0 \
+    --weight-decay 0.1 \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --init-method-std 0.006 \
+    --initial-loss-scale 65536 \
+    --use-distributed-optimizer \
 "
 
 # Data path (required for tokenizer vocab/merge files)
