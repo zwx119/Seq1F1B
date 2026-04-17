@@ -51,25 +51,36 @@ def model_provider(pre_process=True, post_process=True):
 
 
 def get_batch(data_iterator):
-    """Generate a fixed synthetic batch (deterministic for reproducibility)."""
+    """Generate a batch from the data iterator (same as pretrain_gpt.py)."""
     args = get_args()
-    seq_length = args.seq_length
-    micro_batch_size = args.micro_batch_size
-    # Use fixed synthetic data: all token ids = 1
-    tokens = torch.ones(micro_batch_size, seq_length + 1, dtype=torch.long,
-                        device=torch.cuda.current_device())
-    # Make it slightly more interesting with some variation
-    torch.manual_seed(42)
-    tokens = torch.randint(0, args.padded_vocab_size, (micro_batch_size, seq_length + 1),
-                           device=torch.cuda.current_device())
-    labels = tokens[:, 1:].contiguous()
-    tokens = tokens[:, :-1].contiguous()
-    attention_mask = torch.ones(1, 1, seq_length, seq_length,
-                                device=torch.cuda.current_device(), dtype=torch.bool)
-    attention_mask = torch.tril(attention_mask)
-    loss_mask = torch.ones(micro_batch_size, seq_length,
-                           device=torch.cuda.current_device(), dtype=torch.float)
-    position_ids = torch.arange(seq_length, device=torch.cuda.current_device()).unsqueeze(0).expand(micro_batch_size, -1)
+
+    # Items and their type.
+    keys = ['text']
+    datatype = torch.int64
+
+    # Broadcast data.
+    if data_iterator is not None:
+        data = next(data_iterator)
+    else:
+        data = None
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+
+    # Unpack.
+    tokens_ = data_b['text'].long()
+    labels = tokens_[:, 1:].contiguous()
+    tokens = tokens_[:, :-1].contiguous()
+
+    # Get the masks and position ids.
+    from megatron.utils import get_ltor_masks_and_position_ids
+    from megatron import get_tokenizer
+    tokenizer = get_tokenizer()
+    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        tokens,
+        tokenizer.eod,
+        args.reset_position_ids,
+        args.reset_attention_mask,
+        args.eod_mask_loss)
+
     return tokens, labels, loss_mask, attention_mask, position_ids
 
 
@@ -133,9 +144,35 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
+class SyntheticDataset(torch.utils.data.Dataset):
+    """Dummy dataset that returns random token sequences."""
+    def __init__(self, num_samples, seq_length, vocab_size, seed=42):
+        self.num_samples = num_samples
+        self.seq_length = seq_length
+        self.vocab_size = vocab_size
+        self.seed = seed
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # Deterministic per-sample random data
+        rng = torch.Generator()
+        rng.manual_seed(self.seed + idx)
+        tokens = torch.randint(0, self.vocab_size, (self.seq_length + 1,), generator=rng)
+        return {'text': tokens}
+
+
 def train_valid_test_datasets_provider(train_val_test_num_samples):
-    """Return None datasets — we use synthetic data."""
-    return None, None, None
+    """Return synthetic datasets so training loop runs."""
+    args = get_args()
+    train_ds = SyntheticDataset(
+        num_samples=train_val_test_num_samples[0],
+        seq_length=args.seq_length,
+        vocab_size=args.padded_vocab_size,
+        seed=args.seed,
+    )
+    return train_ds, None, None
 
 
 if __name__ == "__main__":

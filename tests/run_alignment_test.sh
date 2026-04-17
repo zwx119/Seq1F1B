@@ -69,15 +69,15 @@ options=" \
     --no-save-rng \
 "
 
-# Data path (required by Megatron arg parser)
-if [ -n "${DATA_PATH}" ]; then
-    options="${options} \
-    --data-path ${DATA_PATH}/data/codeparrot_content_document_text_document \
+# Data path (required for tokenizer vocab/merge files)
+if [ -z "${DATA_PATH}" ]; then
+    echo "ERROR: DATA_PATH must be set (need vocab.json and merges.txt)"
+    exit 1
+fi
+options="${options} \
     --vocab-file ${DATA_PATH}/data/vocab.json \
     --merge-file ${DATA_PATH}/data/merges.txt \
-    --split 100,0,0 \
-    "
-fi
+"
 
 OUTPUT_FILE="${SAVE_DIR}/loss_sp${PP_SP}.txt"
 
