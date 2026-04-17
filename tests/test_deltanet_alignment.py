@@ -102,8 +102,8 @@ set_args(_fake_args)
 # ---------------------------------------------------------------------------
 from megatron.core import mpu
 mpu.initialize_model_parallel(
-    tensor_model_parallel_size_=1,
-    pipeline_model_parallel_size_=1,
+    tensor_model_parallel_size=1,
+    pipeline_model_parallel_size=1,
 )
 
 # ---------------------------------------------------------------------------
