@@ -106,6 +106,10 @@ mpu.initialize_model_parallel(
     pipeline_model_parallel_size=1,
 )
 
+# Required for ColumnParallelLinear/RowParallelLinear weight init
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+model_parallel_cuda_manual_seed(_test_args.seed)
+
 # ---------------------------------------------------------------------------
 # 4. Build TransformerConfig
 # ---------------------------------------------------------------------------
