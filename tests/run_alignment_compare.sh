@@ -32,7 +32,8 @@ echo "--- PP_SP=4 (Seq1F1B) last 20 lines ---"
 tail -20 "${SAVE_DIR}/loss_sp4.txt"
 echo ""
 
-# Simple Python comparison
+# Simple Python comparison — save results to file
+COMPARE_OUTPUT="${SAVE_DIR}/compare_result.txt"
 python3 -c "
 import re, sys, os, torch
 
@@ -110,4 +111,7 @@ if all_pass:
 else:
     print('FAILED: Hidden states diverge on some stages.')
     sys.exit(1)
-"
+" 2>&1 | tee "${COMPARE_OUTPUT}"
+
+echo ""
+echo "Compare result saved to: ${COMPARE_OUTPUT}"
