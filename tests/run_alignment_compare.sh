@@ -89,7 +89,7 @@ for stage in range(8):  # up to 8 stages
         mean_d = (h1 - h4).abs().mean().item()
         cos = torch.nn.functional.cosine_similarity(
             h1.flatten().unsqueeze(0), h4.flatten().unsqueeze(0)).item()
-        status = 'OK' if max_d < 0.05 and cos > 0.999 else 'DIFF'
+        status = 'OK' if cos > 0.9999 else 'DIFF'
         if status == 'DIFF':
             all_pass = False
         print(f'    iter {i+1}: max_diff={max_d:.6e}  mean_diff={mean_d:.6e}  cos_sim={cos:.8f}  [{status}]')

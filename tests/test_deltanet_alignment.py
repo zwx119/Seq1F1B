@@ -27,10 +27,7 @@ from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.core.pipeline_parallel.sp_utils import get_splits
 
 # ── Global state for capturing hidden states ──
-# _hs_chunks[iter_idx] = list of [s_chunk, b, h] tensors within one iteration
-_hs_chunks = []         # collected hidden-state chunks (per sp call)
-_hs_per_iteration = []  # after each iteration: concatenated [s, b, h]
-_sp_call_count = 0      # counts forward calls to know when an iteration ends
+_hs_chunks = []  # raw per-forward-call hidden states from hook
 
 
 def _get_save_dir():
@@ -114,7 +111,6 @@ _get_batch_sp = get_batch_sp_func_factory()
 
 def loss_func(loss_mask, output_tensor):
     """Loss function."""
-    global _sp_call_count
     losses = output_tensor.float()
     start = loss_mask._start
     end = loss_mask._end
@@ -126,15 +122,6 @@ def loss_func(loss_mask, output_tensor):
         loss = torch.sum(losses.view(-1) * loss_mask_p) / loss_mask_full.sum() * args.pipe_sp_splits
     else:
         loss = torch.sum(losses.view(-1) * loss_mask_full) / loss_mask_full.sum()
-
-    # Track when a full iteration completes (all sp chunks done)
-    _sp_call_count += 1
-    if _sp_call_count % args.pipe_sp_splits == 0:
-        # One full iteration done — concatenate all chunks from this iteration
-        n = args.pipe_sp_splits
-        chunks = _hs_chunks[-n:]  # last N chunks belong to this iteration
-        combined = torch.cat(chunks, dim=0)  # [s, b, h]
-        _hs_per_iteration.append(combined)
 
     from megatron.utils import average_losses_across_data_parallel_group
     averaged_loss = average_losses_across_data_parallel_group([loss])
@@ -184,20 +171,25 @@ def _save_hidden_states():
     """Called after training to save captured hidden states to disk."""
     args = get_args()
     rank = parallel_state.get_pipeline_model_parallel_rank()
-    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     sp = args.pipe_sp_splits
     save_dir = _get_save_dir()
 
-    # Save per-stage hidden states
-    save_path = os.path.join(save_dir, f"hs_sp{sp}_stage{rank}.pt")
-    torch.save(_hs_per_iteration, save_path)
-    if rank == 0:
-        print(f"[Rank {dist.get_rank()}] Saved {len(_hs_per_iteration)} "
-              f"iterations of hidden states to {save_path}")
+    # Group raw chunks into per-iteration tensors.
+    # Each iteration produces `sp` forward calls on this stage,
+    # so _hs_chunks has len = num_iters * sp.
+    # For SP=1, each chunk IS a full iteration.
+    hs_per_iter = []
+    n_chunks = len(_hs_chunks)
+    for i in range(0, n_chunks, sp):
+        group = _hs_chunks[i : i + sp]
+        if len(group) == sp:
+            combined = torch.cat(group, dim=0)  # [s_full, b, h]
+            hs_per_iter.append(combined)
 
-    # Also save raw chunks for debugging
-    save_path_raw = os.path.join(save_dir, f"hs_sp{sp}_stage{rank}_raw.pt")
-    torch.save(_hs_chunks, save_path_raw)
+    save_path = os.path.join(save_dir, f"hs_sp{sp}_stage{rank}.pt")
+    torch.save(hs_per_iter, save_path)
+    print(f"[Stage {rank}] Saved {len(hs_per_iter)} iterations "
+          f"({n_chunks} raw chunks, sp={sp}) to {save_path}")
 
     dist.barrier()
 
