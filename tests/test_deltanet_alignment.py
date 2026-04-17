@@ -28,8 +28,10 @@ from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.core.pipeline_parallel.sp_utils import get_splits
 
 # ── Global state for capturing hidden states ──
-_hs_chunks = []  # raw per-forward-call hidden states from hook
-_SAVE_LAST_N_ITERS = int(os.environ.get("SAVE_LAST_N_ITERS", "5"))  # only keep last N iters
+_hs_chunks = {}    # dict: iter_number -> list of chunks for that iter
+_fwd_count = 0     # total forward calls on this stage
+_SAVE_EARLY_ITER = int(os.environ.get("SAVE_EARLY_ITER", "10"))  # save at this iter
+_SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "3"))           # save last N iters
 
 
 def _get_save_dir():
@@ -56,13 +58,29 @@ def model_provider(pre_process=True, post_process=True):
     encoder = model.language_model.encoder
 
     def _capture_hook(module, input, output):
-        """Capture encoder output hidden states (bounded to last N iters)."""
+        """Capture encoder output at specific iterations only."""
+        global _fwd_count
         args = get_args()
-        max_chunks = _SAVE_LAST_N_ITERS * args.pipe_sp_splits
-        _hs_chunks.append(output.detach().clone())
-        # Trim to keep only the last N iterations worth of chunks
-        while len(_hs_chunks) > max_chunks:
-            _hs_chunks.pop(0)
+        sp = args.pipe_sp_splits
+        _fwd_count += 1
+        # Which iteration is this? (1-indexed)
+        cur_iter = (_fwd_count - 1) // sp + 1
+        chunk_idx = (_fwd_count - 1) % sp
+
+        # We always buffer current iter; cleanup happens at iter boundary
+        if cur_iter not in _hs_chunks:
+            _hs_chunks[cur_iter] = []
+        _hs_chunks[cur_iter].append(output.detach().clone())
+
+        # At the end of each iter, prune: only keep early iter + last N
+        if chunk_idx == sp - 1:
+            keep_iters = {_SAVE_EARLY_ITER}
+            # Keep last N: [cur_iter - _SAVE_LAST_N + 1, cur_iter]
+            for j in range(max(1, cur_iter - _SAVE_LAST_N + 1), cur_iter + 1):
+                keep_iters.add(j)
+            for k in list(_hs_chunks.keys()):
+                if k not in keep_iters:
+                    del _hs_chunks[k]
 
     encoder.register_forward_hook(_capture_hook)
 
@@ -180,22 +198,19 @@ def _save_hidden_states():
     sp = args.pipe_sp_splits
     save_dir = _get_save_dir()
 
-    # Group raw chunks into per-iteration tensors.
-    # Each iteration produces `sp` forward calls on this stage,
-    # so _hs_chunks has len = num_iters * sp.
-    # For SP=1, each chunk IS a full iteration.
-    hs_per_iter = []
-    n_chunks = len(_hs_chunks)
-    for i in range(0, n_chunks, sp):
-        group = _hs_chunks[i : i + sp]
-        if len(group) == sp:
-            combined = torch.cat(group, dim=0)  # [s_full, b, h]
-            hs_per_iter.append(combined)
+    # _hs_chunks is dict: iter_number -> list of sp chunks
+    # Combine chunks per iter into full-seq tensors
+    hs_dict = {}
+    for iter_num, chunks in sorted(_hs_chunks.items()):
+        if len(chunks) == sp:
+            combined = torch.cat(chunks, dim=0)  # [s_full, b, h]
+            hs_dict[iter_num] = combined
 
     save_path = os.path.join(save_dir, f"hs_sp{sp}_stage{rank}.pt")
-    torch.save(hs_per_iter, save_path)
-    print(f"[Stage {rank}] Saved {len(hs_per_iter)} iterations "
-          f"({n_chunks} raw chunks, sp={sp}) to {save_path}")
+    torch.save(hs_dict, save_path)
+    saved_iters = sorted(hs_dict.keys())
+    print(f"[Stage {rank}] Saved iters {saved_iters} "
+          f"(sp={sp}) to {save_path}")
 
     dist.barrier()
 

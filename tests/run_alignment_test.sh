@@ -9,7 +9,7 @@ set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-GPUS=${GPUS_PER_NODE:-4}
+GPUS=${GPUS_PER_NODE:-8}
 PP_SP=${PP_SP:-1}
 PP_SP_STR=${PP_SP_STR:-average}
 SEQ_LEN=${SEQ_LEN:-8192}

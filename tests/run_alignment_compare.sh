@@ -77,23 +77,22 @@ else:
 
 # ── 2. Compare hidden states (per PP stage) ──
 print()
-print('=== Hidden States Comparison (last N iters only) ===')
+print('=== Hidden States Comparison (iter 10 + last 3) ===')
 all_pass = True
-# Find all stage files
 for stage in range(8):  # up to 8 stages
     f1 = os.path.join(SAVE_DIR, f'hs_sp1_stage{stage}.pt')
     f4 = os.path.join(SAVE_DIR, f'hs_sp4_stage{stage}.pt')
     if not os.path.exists(f1) or not os.path.exists(f4):
         continue
-    hs1 = torch.load(f1, map_location='cpu')
+    hs1 = torch.load(f1, map_location='cpu')  # dict: iter_num -> tensor
     hs4 = torch.load(f4, map_location='cpu')
-    n = min(len(hs1), len(hs4))
-    print(f'  PP Stage {stage}: {n} iterations, shape={hs1[0].shape if hs1 else \"?\"} vs {hs4[0].shape if hs4 else \"?\"}')
-    for i in range(n):
-        h1 = hs1[i].float()
-        h4 = hs4[i].float()
+    common_iters = sorted(set(hs1.keys()) & set(hs4.keys()))
+    print(f'  PP Stage {stage}: comparing iters {common_iters}')
+    for it in common_iters:
+        h1 = hs1[it].float()
+        h4 = hs4[it].float()
         if h1.shape != h4.shape:
-            print(f'    iter {i+1}: SHAPE MISMATCH {h1.shape} vs {h4.shape}')
+            print(f'    iter {it}: SHAPE MISMATCH {h1.shape} vs {h4.shape}')
             all_pass = False
             continue
         max_d = (h1 - h4).abs().max().item()
@@ -103,7 +102,7 @@ for stage in range(8):  # up to 8 stages
         status = 'OK' if cos > 0.9999 else 'DIFF'
         if status == 'DIFF':
             all_pass = False
-        print(f'    iter {i+1}: max_diff={max_d:.6e}  mean_diff={mean_d:.6e}  cos_sim={cos:.8f}  [{status}]')
+        print(f'    iter {it}: max_diff={max_d:.6e}  mean_diff={mean_d:.6e}  cos_sim={cos:.8f}  [{status}]')
 
 print()
 if all_pass:
