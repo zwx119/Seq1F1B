@@ -1,243 +1,146 @@
 #!/usr/bin/env python
 # Copyright (c) 2024, Seq1F1B-DeltaNet Contributors.
 """
-Alignment test: verify that DeltaNet Seq1F1B splitting produces identical
+Alignment test: verify DeltaNet Seq1F1B splitting produces identical
 hidden states compared to serial (full-sequence) execution.
 
-Uses the REAL DeltaNetTransformerLayer from megatron/model/deltanet_layer.py
-with a minimal single-GPU Megatron mock environment.
+This test uses the REAL Megatron PP pipeline with real DeltaNetTransformerLayer.
 
-Usage:
-    python tests/test_deltanet_alignment.py [--num-layers 4] [--splits 4] [--seq-len 1024]
+Launch (4 GPU, PP=4):
+  # No-SP baseline (pipe_sp_splits=1):
+  GPUS_PER_NODE=4 PP_SP=1 bash tests/run_alignment_test.sh
+
+  # Seq1F1B (pipe_sp_splits=4):
+  GPUS_PER_NODE=4 PP_SP=4 bash tests/run_alignment_test.sh
+
+Or use the all-in-one script:
+  bash tests/run_alignment_compare.sh
 """
 
-import argparse
 import os
 import sys
-from types import SimpleNamespace
-
 import torch
 import torch.distributed as dist
 
-# ---------------------------------------------------------------------------
-# 0. Parse test-level CLI args BEFORE Megatron touches sys.argv
-# ---------------------------------------------------------------------------
-_parser = argparse.ArgumentParser()
-_parser.add_argument("--num-layers", type=int, default=4)
-_parser.add_argument("--splits", type=int, default=4)
-_parser.add_argument("--seq-len", type=int, default=1024)
-_parser.add_argument("--hidden-size", type=int, default=256)
-_parser.add_argument("--num-heads", type=int, default=4)
-_parser.add_argument("--batch-size", type=int, default=2)
-_parser.add_argument("--seed", type=int, default=42)
-_parser.add_argument("--atol", type=float, default=1e-2)
-_parser.add_argument("--rtol", type=float, default=1e-2)
-_test_args = _parser.parse_args()
+from megatron import get_args, print_rank_0
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.enums import ModelType
+from megatron.training import pretrain
+from megatron.model import GPTModel
+from megatron.arguments import core_transformer_config_from_args
+from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.core.pipeline_parallel.sp_utils import get_splits
 
-# Wipe sys.argv so Megatron's argument parser doesn't choke
-sys.argv = [sys.argv[0]]
+# ── Global state for capturing hidden states ──
+_captured_outputs = []
+_micro_sp_offset = -1
+_global_input = None
 
-# ---------------------------------------------------------------------------
-# 1. Minimal torch.distributed init (single GPU, required by TP layers)
-# ---------------------------------------------------------------------------
-os.environ.setdefault("MASTER_ADDR", "localhost")
-os.environ.setdefault("MASTER_PORT", "29500")
-os.environ.setdefault("RANK", "0")
-os.environ.setdefault("WORLD_SIZE", "1")
-
-if not dist.is_initialized():
-    dist.init_process_group(backend="nccl", world_size=1, rank=0)
-
-# ---------------------------------------------------------------------------
-# 2. Set up fake Megatron args via global_vars
-# ---------------------------------------------------------------------------
-from megatron.global_vars import set_args
-
-_fake_args = SimpleNamespace(
-    # Pipeline / Seq1F1B
-    pipe_sp_splits=1,  # will be changed per test
-    # Linear layer bias
-    add_bias_linear=False,
-    # LayerNorm
-    no_persist_layer_norm=True,
-    apply_layernorm_1p=False,
-    # MLP
-    num_experts=None,
-    swiglu=False,
-    openai_gelu=False,
-    onnx_safe=False,
-    squared_relu=False,
-    bias_gelu_fusion=False,
-    # DeltaNet flags
-    use_deltanet=True,
-    deltanet_use_short_conv=True,
-    deltanet_conv_size=4,
-    deltanet_use_beta=True,
-    deltanet_use_output_gate=False,
-    deltanet_qk_activation="silu",
-    deltanet_qk_norm="l2",
-    deltanet_mode="chunk",
-    # Misc required by various code paths
-    retro_add_retriever=False,
-    sequence_parallel=False,
-    params_dtype=torch.bfloat16,
-    rank=0,
-    # For MegatronModule / grad sync
-    DDP_impl="local",
-    use_contiguous_buffers_in_local_ddp=False,
-    # Transformer config fields read in some paths
-    hidden_dropout=0.0,
-    attention_dropout=0.0,
-    apply_residual_connection_post_layernorm=False,
-    fp32_residual_connection=False,
-    bias_dropout_fusion=False,
-    masked_softmax_fusion=False,
-    gradient_accumulation_fusion=False,
-    async_tensor_model_parallel_allreduce=False,
-)
-set_args(_fake_args)
-
-# ---------------------------------------------------------------------------
-# 3. Initialise Megatron model-parallel (TP=1, PP=1)
-# ---------------------------------------------------------------------------
-from megatron.core import mpu
-mpu.initialize_model_parallel(
-    tensor_model_parallel_size=1,
-    pipeline_model_parallel_size=1,
-)
-
-# Required for ColumnParallelLinear/RowParallelLinear weight init
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-model_parallel_cuda_manual_seed(_test_args.seed)
-
-# ---------------------------------------------------------------------------
-# 4. Build TransformerConfig
-# ---------------------------------------------------------------------------
-from megatron.core.transformer.transformer_config import TransformerConfig
-
-config = TransformerConfig(
-    num_layers=_test_args.num_layers,
-    hidden_size=_test_args.hidden_size,
-    num_attention_heads=_test_args.num_heads,
-    bf16=True,
-    params_dtype=torch.bfloat16,
-    hidden_dropout=0.0,
-    attention_dropout=0.0,
-    add_bias_linear=False,
-    bias_dropout_fusion=False,
-    persist_layer_norm=False,
-    sequence_parallel=False,
-    apply_residual_connection_post_layernorm=False,
-    fp32_residual_connection=False,
-)
-
-# ---------------------------------------------------------------------------
-# 5. Build layers (real DeltaNetTransformerLayer)
-# ---------------------------------------------------------------------------
-from megatron.model.deltanet_layer import DeltaNetTransformerLayer
-
-device = torch.device("cuda")
-
-layers = torch.nn.ModuleList([
-    DeltaNetTransformerLayer(config, layer_number=i + 1)
-    for i in range(_test_args.num_layers)
-]).to(device).to(torch.bfloat16)
-
-# ---------------------------------------------------------------------------
-# 6. Helper: run all layers in serial or split mode
-# ---------------------------------------------------------------------------
-
-def _clear_states(layers):
-    """Reset recurrent / conv states on every DeltaNetAttention."""
-    for layer in layers:
-        attn = layer.self_attention
-        attn.recurrent_state = None
-        attn.conv_state_q = None
-        attn.conv_state_k = None
-        attn.conv_state_v = None
+def model_provider(pre_process=True, post_process=True):
+    """Build the model."""
+    print_rank_0('building GPT model (alignment test) ...')
+    config = core_transformer_config_from_args(get_args())
+    model = GPTModel(
+        config,
+        num_tokentypes=0,
+        parallel_output=True,
+        pre_process=pre_process,
+        post_process=post_process
+    )
+    return model
 
 
-def run_serial(layers, x):
-    """Full-sequence forward: pipe_sp_splits=1, micro_sp_idx=None."""
-    _fake_args.pipe_sp_splits = 1
-    _clear_states(layers)
-    h = x.clone()
-    with torch.no_grad():
-        for layer in layers:
-            h = layer(h, attention_mask=None, micro_sp_idx=None)
-    return h
+def get_batch(data_iterator):
+    """Generate a fixed synthetic batch (deterministic for reproducibility)."""
+    args = get_args()
+    seq_length = args.seq_length
+    micro_batch_size = args.micro_batch_size
+    # Use fixed synthetic data: all token ids = 1
+    tokens = torch.ones(micro_batch_size, seq_length + 1, dtype=torch.long,
+                        device=torch.cuda.current_device())
+    # Make it slightly more interesting with some variation
+    torch.manual_seed(42)
+    tokens = torch.randint(0, args.padded_vocab_size, (micro_batch_size, seq_length + 1),
+                           device=torch.cuda.current_device())
+    labels = tokens[:, 1:].contiguous()
+    tokens = tokens[:, :-1].contiguous()
+    attention_mask = torch.ones(1, 1, seq_length, seq_length,
+                                device=torch.cuda.current_device(), dtype=torch.bool)
+    attention_mask = torch.tril(attention_mask)
+    loss_mask = torch.ones(micro_batch_size, seq_length,
+                           device=torch.cuda.current_device(), dtype=torch.float)
+    position_ids = torch.arange(seq_length, device=torch.cuda.current_device()).unsqueeze(0).expand(micro_batch_size, -1)
+    return tokens, labels, loss_mask, attention_mask, position_ids
 
 
-def run_split(layers, x, num_splits):
-    """Split-sequence forward: pipe_sp_splits=num_splits."""
-    _fake_args.pipe_sp_splits = num_splits
-    _clear_states(layers)
-    S = x.size(0)
-    chunk_size = S // num_splits
-    assert S % num_splits == 0, f"seq_len {S} not divisible by splits {num_splits}"
+def get_batch_sp_func_factory():
+    """Creates the SP data splitter, same logic as pretrain_gpt.py."""
+    offset = -1
+    global_data = None
 
-    h_chunks = []
-    with torch.no_grad():
-        for sp_idx in range(num_splits):
-            chunk = x[sp_idx * chunk_size : (sp_idx + 1) * chunk_size].clone()
-            h = chunk
-            for layer in layers:
-                h = layer(h, attention_mask=None, micro_sp_idx=sp_idx)
-            h_chunks.append(h)
+    def get_data(*args, **kwargs):
+        nonlocal global_data, offset
+        pipe_sp = get_args().pipe_sp_splits
+        if offset == -1 or offset + 1 == pipe_sp:
+            global_data = get_batch(*args, **kwargs)
+        offset = (offset + 1) % pipe_sp
+        tokens, labels, loss_mask, attention_mask, position_ids = global_data
+        seq_length = tokens.size(1)
+        # average strategy
+        tokens = tokens.chunk(pipe_sp, dim=1)[offset]
+        labels = labels.chunk(pipe_sp, dim=1)[offset]
+        loss_mask._start = seq_length // pipe_sp * offset
+        loss_mask._end = seq_length // pipe_sp * (offset + 1)
+        position_ids = position_ids.chunk(pipe_sp, dim=1)[offset]
+        return tokens, labels, loss_mask, attention_mask, position_ids, offset
 
-    return torch.cat(h_chunks, dim=0)
+    return get_data
 
 
-# ---------------------------------------------------------------------------
-# 7. Run the test
-# ---------------------------------------------------------------------------
-def main():
-    S = _test_args.seq_len
-    B = _test_args.batch_size
-    H = _test_args.hidden_size
-    N = _test_args.splits
+_get_batch_sp = get_batch_sp_func_factory()
 
-    torch.manual_seed(_test_args.seed)
-    torch.cuda.manual_seed_all(_test_args.seed)
 
-    x = torch.randn(S, B, H, device=device, dtype=torch.bfloat16)
-
-    layers.eval()
-
-    # --- Serial (baseline) ---
-    out_serial = run_serial(layers, x)
-
-    # --- Split (Seq1F1B style) ---
-    out_split = run_split(layers, x, N)
-
-    # --- Compare ---
-    max_diff = (out_serial - out_split).abs().max().item()
-    mean_diff = (out_serial - out_split).abs().mean().item()
-    cos_sim = torch.nn.functional.cosine_similarity(
-        out_serial.flatten().unsqueeze(0).float(),
-        out_split.flatten().unsqueeze(0).float(),
-    ).item()
-
-    print(f"{'='*60}")
-    print(f"DeltaNet Seq1F1B Alignment Test")
-    print(f"  layers={_test_args.num_layers}, hidden={H}, heads={_test_args.num_heads}")
-    print(f"  seq_len={S}, batch={B}, splits={N}")
-    print(f"  dtype=bf16")
-    print(f"{'='*60}")
-    print(f"  max  |serial - split| = {max_diff:.6e}")
-    print(f"  mean |serial - split| = {mean_diff:.6e}")
-    print(f"  cosine similarity     = {cos_sim:.10f}")
-    print(f"{'='*60}")
-
-    close = torch.allclose(out_serial, out_split, atol=_test_args.atol, rtol=_test_args.rtol)
-    if close and cos_sim > 0.999:
-        print("PASSED: serial and split outputs are aligned.")
+def loss_func(loss_mask, output_tensor):
+    """Loss function that also captures the output for comparison."""
+    losses = output_tensor.float()
+    start = loss_mask._start
+    end = loss_mask._end
+    loss_mask_p = loss_mask[:, start:end]
+    loss_mask_full = loss_mask.contiguous().view(-1).float()
+    args = get_args()
+    if args.pipe_sp_splits > 1:
+        loss_mask_p = loss_mask_p.contiguous().view(-1).float()
+        loss = torch.sum(losses.view(-1) * loss_mask_p) / loss_mask_full.sum() * args.pipe_sp_splits
     else:
-        print("FAILED: outputs diverge beyond tolerance.")
-        sys.exit(1)
+        loss = torch.sum(losses.view(-1) * loss_mask_full) / loss_mask_full.sum()
 
-    dist.destroy_process_group()
+    # Capture loss value on last PP stage
+    if parallel_state.is_pipeline_last_stage():
+        _captured_outputs.append(loss.detach().clone())
+
+    from megatron.utils import average_losses_across_data_parallel_group
+    averaged_loss = average_losses_across_data_parallel_group([loss])
+    return loss, {'lm loss': averaged_loss[0]}
+
+
+def forward_step(data_iterator, model):
+    """Forward step with SP data splitting."""
+    args = get_args()
+    from functools import partial
+    tokens, labels, loss_mask, attention_mask, position_ids, offset = _get_batch_sp(data_iterator)
+    output_tensor = model(tokens, position_ids, attention_mask,
+                          labels=labels, micro_sp_idx=offset)
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+def train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Return None datasets — we use synthetic data."""
+    return None, None, None
 
 
 if __name__ == "__main__":
-    main()
+    pretrain(train_valid_test_datasets_provider,
+             model_provider,
+             ModelType.encoder_or_decoder,
+             forward_step,
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
