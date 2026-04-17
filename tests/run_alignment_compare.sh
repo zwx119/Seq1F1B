@@ -3,7 +3,7 @@
 # Compares loss values between serial and Seq1F1B execution.
 #
 # Usage:
-#   bash tests/run_alignment_compare.sh
+#   DATA_PATH=/path/to/data bash tests/run_alignment_compare.sh
 set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)

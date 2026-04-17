@@ -20,6 +20,8 @@ MICRO_BATCH=${MICRO_BATCH:-1}
 GLOBAL_BATCH=${GLOBAL_BATCH:-4}
 TRAIN_ITER=${TRAIN_ITER:-500}
 
+DATA_PATH=${DATA_PATH:-""}
+
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 SAVE_DIR="${DIR}/tests/alignment_outputs"
 mkdir -p "${SAVE_DIR}"
@@ -72,6 +74,16 @@ options=" \
     --init-method-std 0.006 \
     --initial-loss-scale 65536 \
     --use-distributed-optimizer \
+"
+
+# Data path (required for tokenizer vocab/merge files)
+if [ -z "${DATA_PATH}" ]; then
+    echo "ERROR: DATA_PATH must be set (need vocab.json and merges.txt)"
+    exit 1
+fi
+options="${options} \
+    --vocab-file ${DATA_PATH}/data/vocab.json \
+    --merge-file ${DATA_PATH}/data/merges.txt \
 "
 
 OUTPUT_FILE="${SAVE_DIR}/loss_sp${PP_SP}.txt"

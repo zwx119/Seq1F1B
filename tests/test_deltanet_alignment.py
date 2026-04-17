@@ -227,5 +227,4 @@ if __name__ == "__main__":
                       model_provider,
                       ModelType.encoder_or_decoder,
                       forward_step,
-                      args_defaults={'tokenizer_type': 'NullTokenizer',
-                                     'vocab_size': 151936})
+                      args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
