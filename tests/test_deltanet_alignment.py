@@ -5,16 +5,11 @@ Alignment test: verify DeltaNet Seq1F1B splitting produces identical
 hidden states compared to serial (full-sequence) execution.
 
 This test uses the REAL Megatron PP pipeline with real DeltaNetTransformerLayer.
+It captures hidden states (ParallelTransformer output) on EVERY PP stage
+and saves them to disk for comparison between SP=1 and SP=4.
 
-Launch (4 GPU, PP=4):
-  # No-SP baseline (pipe_sp_splits=1):
-  GPUS_PER_NODE=4 PP_SP=1 bash tests/run_alignment_test.sh
-
-  # Seq1F1B (pipe_sp_splits=4):
-  GPUS_PER_NODE=4 PP_SP=4 bash tests/run_alignment_test.sh
-
-Or use the all-in-one script:
-  bash tests/run_alignment_compare.sh
+Launch:
+  DATA_PATH=/path/to/data bash tests/run_alignment_compare.sh
 """
 
 import os
@@ -32,12 +27,21 @@ from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.core.pipeline_parallel.sp_utils import get_splits
 
 # ── Global state for capturing hidden states ──
-_captured_outputs = []
-_micro_sp_offset = -1
-_global_input = None
+# _hs_chunks[iter_idx] = list of [s_chunk, b, h] tensors within one iteration
+_hs_chunks = []         # collected hidden-state chunks (per sp call)
+_hs_per_iteration = []  # after each iteration: concatenated [s, b, h]
+_sp_call_count = 0      # counts forward calls to know when an iteration ends
+
+
+def _get_save_dir():
+    args = get_args()
+    save_dir = os.path.join(os.path.dirname(__file__), "alignment_outputs")
+    os.makedirs(save_dir, exist_ok=True)
+    return save_dir
+
 
 def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
+    """Build the model and register hidden-state capture hook."""
     print_rank_0('building GPT model (alignment test) ...')
     config = core_transformer_config_from_args(get_args())
     model = GPTModel(
@@ -47,40 +51,39 @@ def model_provider(pre_process=True, post_process=True):
         pre_process=pre_process,
         post_process=post_process
     )
+
+    # Register forward hook on the encoder (ParallelTransformer) to
+    # capture hidden states on this PP stage.
+    encoder = model.language_model.encoder
+
+    def _capture_hook(module, input, output):
+        """Capture encoder output hidden states."""
+        # output is [s_chunk, b, h]
+        _hs_chunks.append(output.detach().clone())
+
+    encoder.register_forward_hook(_capture_hook)
+
     return model
 
 
 def get_batch(data_iterator):
     """Generate a batch from the data iterator (same as pretrain_gpt.py)."""
     args = get_args()
-
-    # Items and their type.
     keys = ['text']
     datatype = torch.int64
-
-    # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
-
-    # Unpack.
     tokens_ = data_b['text'].long()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
-
-    # Get the masks and position ids.
-    from megatron.utils import get_ltor_masks_and_position_ids
     from megatron import get_tokenizer
     tokenizer = get_tokenizer()
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
-
+        tokens, tokenizer.eod,
+        args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss)
     return tokens, labels, loss_mask, attention_mask, position_ids
 
 
@@ -97,7 +100,6 @@ def get_batch_sp_func_factory():
         offset = (offset + 1) % pipe_sp
         tokens, labels, loss_mask, attention_mask, position_ids = global_data
         seq_length = tokens.size(1)
-        # average strategy
         tokens = tokens.chunk(pipe_sp, dim=1)[offset]
         labels = labels.chunk(pipe_sp, dim=1)[offset]
         loss_mask._start = seq_length // pipe_sp * offset
@@ -107,12 +109,12 @@ def get_batch_sp_func_factory():
 
     return get_data
 
-
 _get_batch_sp = get_batch_sp_func_factory()
 
 
 def loss_func(loss_mask, output_tensor):
-    """Loss function that also captures the output for comparison."""
+    """Loss function."""
+    global _sp_call_count
     losses = output_tensor.float()
     start = loss_mask._start
     end = loss_mask._end
@@ -125,9 +127,14 @@ def loss_func(loss_mask, output_tensor):
     else:
         loss = torch.sum(losses.view(-1) * loss_mask_full) / loss_mask_full.sum()
 
-    # Capture loss value on last PP stage
-    if parallel_state.is_pipeline_last_stage():
-        _captured_outputs.append(loss.detach().clone())
+    # Track when a full iteration completes (all sp chunks done)
+    _sp_call_count += 1
+    if _sp_call_count % args.pipe_sp_splits == 0:
+        # One full iteration done — concatenate all chunks from this iteration
+        n = args.pipe_sp_splits
+        chunks = _hs_chunks[-n:]  # last N chunks belong to this iteration
+        combined = torch.cat(chunks, dim=0)  # [s, b, h]
+        _hs_per_iteration.append(combined)
 
     from megatron.utils import average_losses_across_data_parallel_group
     averaged_loss = average_losses_across_data_parallel_group([loss])
@@ -136,7 +143,6 @@ def loss_func(loss_mask, output_tensor):
 
 def forward_step(data_iterator, model):
     """Forward step with SP data splitting."""
-    args = get_args()
     from functools import partial
     tokens, labels, loss_mask, attention_mask, position_ids, offset = _get_batch_sp(data_iterator)
     output_tensor = model(tokens, position_ids, attention_mask,
@@ -156,7 +162,6 @@ class SyntheticDataset(torch.utils.data.Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # Deterministic per-sample random data
         rng = torch.Generator()
         rng.manual_seed(self.seed + idx)
         tokens = torch.randint(0, self.vocab_size, (self.seq_length + 1,), generator=rng)
@@ -175,9 +180,38 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     return train_ds, None, None
 
 
+def _save_hidden_states():
+    """Called after training to save captured hidden states to disk."""
+    args = get_args()
+    rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+    sp = args.pipe_sp_splits
+    save_dir = _get_save_dir()
+
+    # Save per-stage hidden states
+    save_path = os.path.join(save_dir, f"hs_sp{sp}_stage{rank}.pt")
+    torch.save(_hs_per_iteration, save_path)
+    if rank == 0:
+        print(f"[Rank {dist.get_rank()}] Saved {len(_hs_per_iteration)} "
+              f"iterations of hidden states to {save_path}")
+
+    # Also save raw chunks for debugging
+    save_path_raw = os.path.join(save_dir, f"hs_sp{sp}_stage{rank}_raw.pt")
+    torch.save(_hs_chunks, save_path_raw)
+
+    dist.barrier()
+
+
+# ── Monkey-patch pretrain to save hidden states after training ──
+_original_pretrain = pretrain
+
+def _patched_pretrain(*args, **kwargs):
+    _original_pretrain(*args, **kwargs)
+    _save_hidden_states()
+
 if __name__ == "__main__":
-    pretrain(train_valid_test_datasets_provider,
-             model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    _patched_pretrain(train_valid_test_datasets_provider,
+                      model_provider,
+                      ModelType.encoder_or_decoder,
+                      forward_step,
+                      args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
