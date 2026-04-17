@@ -18,7 +18,7 @@ HIDDEN=${HIDDEN:-1024}
 NUM_HEADS=${NUM_HEADS:-16}
 MICRO_BATCH=${MICRO_BATCH:-1}
 GLOBAL_BATCH=${GLOBAL_BATCH:-4}
-TRAIN_ITER=${TRAIN_ITER:-10}
+TRAIN_ITER=${TRAIN_ITER:-500}
 
 # We need data-path for Megatron's arg parser even though we use synthetic data.
 # Point to actual data or create a dummy.
@@ -97,5 +97,5 @@ echo "============================================="
 eval ${run_cmd} 2>&1 | tee "${SAVE_DIR}/log_sp${PP_SP}.txt"
 
 # Extract loss from log
-grep "lm loss" "${SAVE_DIR}/log_sp${PP_SP}.txt" | head -${TRAIN_ITER} > "${OUTPUT_FILE}" || true
+grep "lm loss" "${SAVE_DIR}/log_sp${PP_SP}.txt" > "${OUTPUT_FILE}" || true
 echo "Loss saved to ${OUTPUT_FILE}"

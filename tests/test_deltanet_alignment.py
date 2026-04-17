@@ -16,6 +16,7 @@ import os
 import sys
 import torch
 import torch.distributed as dist
+from collections import deque
 
 from megatron import get_args, print_rank_0
 from megatron.core import parallel_state, tensor_parallel
@@ -28,6 +29,7 @@ from megatron.core.pipeline_parallel.sp_utils import get_splits
 
 # ── Global state for capturing hidden states ──
 _hs_chunks = []  # raw per-forward-call hidden states from hook
+_SAVE_LAST_N_ITERS = int(os.environ.get("SAVE_LAST_N_ITERS", "5"))  # only keep last N iters
 
 
 def _get_save_dir():
@@ -54,9 +56,13 @@ def model_provider(pre_process=True, post_process=True):
     encoder = model.language_model.encoder
 
     def _capture_hook(module, input, output):
-        """Capture encoder output hidden states."""
-        # output is [s_chunk, b, h]
+        """Capture encoder output hidden states (bounded to last N iters)."""
+        args = get_args()
+        max_chunks = _SAVE_LAST_N_ITERS * args.pipe_sp_splits
         _hs_chunks.append(output.detach().clone())
+        # Trim to keep only the last N iterations worth of chunks
+        while len(_hs_chunks) > max_chunks:
+            _hs_chunks.pop(0)
 
     encoder.register_forward_hook(_capture_hook)
 

@@ -25,11 +25,11 @@ echo ""
 echo "======================================================"
 echo "  Step 3: Comparing losses"
 echo "======================================================"
-echo "--- PP_SP=1 (baseline) ---"
-cat "${SAVE_DIR}/loss_sp1.txt"
+echo "--- PP_SP=1 (baseline) last 20 lines ---"
+tail -20 "${SAVE_DIR}/loss_sp1.txt"
 echo ""
-echo "--- PP_SP=4 (Seq1F1B) ---"
-cat "${SAVE_DIR}/loss_sp4.txt"
+echo "--- PP_SP=4 (Seq1F1B) last 20 lines ---"
+tail -20 "${SAVE_DIR}/loss_sp4.txt"
 echo ""
 
 # Simple Python comparison
@@ -57,16 +57,27 @@ else:
     n = min(len(l1), len(l4))
     print(f'=== Loss Comparison ({n} iterations) ===')
     max_diff = 0
+    diffs = []
     for i in range(n):
         diff = abs(l1[i] - l4[i])
         max_diff = max(max_diff, diff)
+        diffs.append(diff)
+    # Summary
+    import statistics
+    print(f'  Total iters: {n}')
+    print(f'  Max  loss diff: {max_diff:.6e}')
+    print(f'  Mean loss diff: {statistics.mean(diffs):.6e}')
+    # Show last 10 iters detail
+    show = min(10, n)
+    print(f'  --- Last {show} iterations ---')
+    for i in range(n - show, n):
+        diff = abs(l1[i] - l4[i])
         status = 'OK' if diff < 0.01 else 'DIFF'
         print(f'  iter {i+1}: SP1={l1[i]:.6f}  SP4={l4[i]:.6f}  diff={diff:.6e}  [{status}]')
-    print(f'  Max loss diff: {max_diff:.6e}')
 
 # ── 2. Compare hidden states (per PP stage) ──
 print()
-print('=== Hidden States Comparison ===')
+print('=== Hidden States Comparison (last N iters only) ===')
 all_pass = True
 # Find all stage files
 for stage in range(8):  # up to 8 stages
