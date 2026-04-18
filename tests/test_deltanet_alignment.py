@@ -31,7 +31,8 @@ from megatron.core.pipeline_parallel.sp_utils import get_splits
 _hs_chunks = {}    # dict: iter_number -> list of chunks for that iter
 _fwd_count = 0     # total forward calls on this stage
 _SAVE_EARLY_ITER = int(os.environ.get("SAVE_EARLY_ITER", "1"))  # save at this iter (1 = before any weight update)
-_SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "0"))           # save last N iters (0 = skip for long training)
+_SAVE_SECOND_ITER = int(os.environ.get("SAVE_SECOND_ITER", "10"))  # also save at this iter
+_SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "3"))           # save last N iters
 
 
 def _get_save_dir():
@@ -84,7 +85,7 @@ def model_provider(pre_process=True, post_process=True):
 
         # At the end of first microbatch, prune old iters
         if chunk_idx == sp - 1:
-            keep_iters = {_SAVE_EARLY_ITER}
+            keep_iters = {_SAVE_EARLY_ITER, _SAVE_SECOND_ITER}
             for j in range(max(1, cur_train_iter - _SAVE_LAST_N + 1), cur_train_iter + 1):
                 keep_iters.add(j)
             for k in list(_hs_chunks.keys()):
