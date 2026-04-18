@@ -62,21 +62,30 @@ def model_provider(pre_process=True, post_process=True):
         global _fwd_count
         args = get_args()
         sp = args.pipe_sp_splits
+        num_micro = args.global_batch_size // args.micro_batch_size
+        fwd_per_iter = sp * num_micro  # total forward calls per training iteration
+
         _fwd_count += 1
-        # Which iteration is this? (1-indexed)
-        cur_iter = (_fwd_count - 1) // sp + 1
-        chunk_idx = (_fwd_count - 1) % sp
+        # Which training iteration is this? (1-indexed)
+        cur_train_iter = (_fwd_count - 1) // fwd_per_iter + 1
+        # Which microbatch within this iteration?
+        within_iter = (_fwd_count - 1) % fwd_per_iter
+        micro_idx = within_iter // sp
+        chunk_idx = within_iter % sp
 
-        # We always buffer current iter; cleanup happens at iter boundary
-        if cur_iter not in _hs_chunks:
-            _hs_chunks[cur_iter] = []
-        _hs_chunks[cur_iter].append(output.detach().clone())
+        # Only capture the FIRST microbatch of each iteration (micro_idx == 0)
+        if micro_idx != 0:
+            return
 
-        # At the end of each iter, prune: only keep early iter + last N
+        # Buffer current iter; cleanup happens at iter boundary
+        if cur_train_iter not in _hs_chunks:
+            _hs_chunks[cur_train_iter] = []
+        _hs_chunks[cur_train_iter].append(output.detach().clone())
+
+        # At the end of first microbatch, prune old iters
         if chunk_idx == sp - 1:
             keep_iters = {_SAVE_EARLY_ITER}
-            # Keep last N: [cur_iter - _SAVE_LAST_N + 1, cur_iter]
-            for j in range(max(1, cur_iter - _SAVE_LAST_N + 1), cur_iter + 1):
+            for j in range(max(1, cur_train_iter - _SAVE_LAST_N + 1), cur_train_iter + 1):
                 keep_iters.add(j)
             for k in list(_hs_chunks.keys()):
                 if k not in keep_iters:
