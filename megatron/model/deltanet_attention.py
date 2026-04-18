@@ -38,6 +38,10 @@ except ImportError:
 
 try:
     from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
+    from fla.ops.delta_rule.chunk import chunk_delta_rule_fwd, chunk_delta_rule_bwd
+    from fla.modules.l2norm import l2norm_fwd, l2norm_bwd
+    from fla.ops.utils.index import prepare_chunk_indices
+    from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
     HAS_FLA = True
 except ImportError:
     HAS_FLA = False
@@ -53,6 +57,86 @@ try:
     HAS_FLA_MODULES = True
 except ImportError:
     HAS_FLA_MODULES = False
+
+
+# ============================================================================
+# DeltaNetChunkFunc: custom autograd Function with backward state gradient relay
+# Analogous to FlashAttnVarlenFunc for softmax attention in Seq1F1B.
+#
+# In Seq1F1B, each sequence is split into chunks processed sequentially.
+# Forward:  chunk_0 -> state_0 -> chunk_1 -> state_1 -> ... -> chunk_{N-1}
+# Backward: chunk_{N-1} -> dh0_{N-1} -> chunk_{N-2} -> dh0_{N-2} -> ... -> chunk_0
+#
+# Since DeltaNetChunkFunc is a custom autograd.Function, autograd does NOT
+# penetrate into its forward (same as FlashAttnVarlenFunc with kv_cache).
+# So final_state needs no .detach() — it has no grad_fn from the inner graph.
+# The gradient relay is handled manually: each chunk's backward stores dh0
+# into a shared state_cache dict, and the previous chunk reads it as dht.
+# ============================================================================
+
+class DeltaNetChunkFunc(torch.autograd.Function):
+    """Wrap chunk_delta_rule_fwd/bwd with manual state gradient relay."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q, k, v, beta,
+        scale,
+        initial_state,       # state from previous chunk (or None)
+        state_cache,         # shared dict for gradient relay (like kv_cache)
+        use_qk_l2norm_in_kernel,
+    ):
+        if use_qk_l2norm_in_kernel:
+            q, q_rstd = l2norm_fwd(q)
+            k, k_rstd = l2norm_fwd(k)
+        else:
+            q_rstd, k_rstd = None, None
+
+        o, A, final_state = chunk_delta_rule_fwd(
+            q=q, k=k, v=v, beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=None,
+            chunk_indices=None,
+        )
+
+        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, beta, A, initial_state)
+        ctx.scale = scale
+        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        ctx._state_cache = state_cache
+
+        return o.to(q.dtype), final_state
+
+    @staticmethod
+    def backward(ctx, do, d_final_state_unused):
+        q, q_rstd, k, k_rstd, v, beta, A, initial_state = ctx.saved_tensors
+        state_cache = ctx._state_cache
+
+        # Retrieve dht from state_cache (stored by the next chunk's backward).
+        # If absent, this is the last chunk (first to run backward), dht=None.
+        dht = state_cache.pop('d_state', None)
+
+        dq, dk, dv, db, dh0 = chunk_delta_rule_bwd(
+            q=q, k=k, v=v, beta=beta, A=A,
+            scale=ctx.scale,
+            initial_state=initial_state,
+            do=do,
+            dht=dht,
+            cu_seqlens=None,
+            chunk_indices=None,
+        )
+
+        # Store dh0 for the previous chunk's backward
+        if dh0 is not None:
+            state_cache['d_state'] = dh0
+
+        if ctx.use_qk_l2norm_in_kernel:
+            dq = l2norm_bwd(q, q_rstd, dq)
+            dk = l2norm_bwd(k, k_rstd, dk)
+
+        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), \
+               None, None, None, None
 
 
 class DeltaNetAttention(MegatronModule):
@@ -207,12 +291,11 @@ class DeltaNetAttention(MegatronModule):
         )
 
         # === Seq1F1B state management ===
-        # recurrent_state: the DeltaNet hidden state S ∈ R^{H, d_k, d_v}
-        # conv_state_*: short convolution cache for each of q, k, v
         self.recurrent_state = None
         self.conv_state_q = None
         self.conv_state_k = None
         self.conv_state_v = None
+        self.state_cache = {}
 
     def _clear_states(self):
         """Clear all cached states. Called when micro_sp_idx == 0."""
@@ -220,6 +303,7 @@ class DeltaNetAttention(MegatronModule):
         self.conv_state_q = None
         self.conv_state_k = None
         self.conv_state_v = None
+        self.state_cache = {}
 
     def forward(
         self,
@@ -347,7 +431,16 @@ class DeltaNetAttention(MegatronModule):
         # Determine if we need to output final state (for next split or not)
         output_final_state = (args.pipe_sp_splits > 1)
 
-        if mode == 'fused_recurrent':
+        if output_final_state and mode == 'chunk':
+            # Seq1F1B path: use DeltaNetChunkFunc with backward state gradient relay
+            o, recurrent_state = DeltaNetChunkFunc.apply(
+                q, k, v, beta,
+                self.head_dim ** -0.5,
+                initial_state,
+                self.state_cache,
+                (self.qk_norm == 'l2'),
+            )
+        elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_delta_rule(
                 q=q, k=k, v=v, beta=beta,
                 initial_state=initial_state,
@@ -364,9 +457,10 @@ class DeltaNetAttention(MegatronModule):
         else:
             raise NotImplementedError(f"DeltaNet mode `{mode}` not supported.")
 
-        # Cache state for next Seq1F1B split
+        # Cache state for next Seq1F1B split (no detach needed — autograd
+        # doesn't penetrate custom autograd.Function internals)
         if output_final_state and recurrent_state is not None:
-            self.recurrent_state = recurrent_state.detach()
+            self.recurrent_state = recurrent_state
 
         # ============ Output normalization & gate ============
         if self.use_gate:
