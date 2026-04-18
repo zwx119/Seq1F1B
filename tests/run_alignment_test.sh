@@ -76,14 +76,16 @@ options=" \
     --use-distributed-optimizer \
 "
 
-# Data path (required for tokenizer vocab/merge files)
+# Data path (required: prefix for .bin/.idx data files AND vocab/merge)
 if [ -z "${DATA_PATH}" ]; then
-    echo "ERROR: DATA_PATH must be set (need vocab.json and merges.txt)"
+    echo "ERROR: DATA_PATH must be set (directory containing data/ with vocab.json, merges.txt and *_document.bin/.idx)"
     exit 1
 fi
 options="${options} \
+    --data-path ${DATA_PATH}/data/codeparrot_content_document_text_document \
     --vocab-file ${DATA_PATH}/data/vocab.json \
     --merge-file ${DATA_PATH}/data/merges.txt \
+    --split 98,2,0 \
 "
 
 DISABLE_STATE_PASSING=${DISABLE_STATE_PASSING:-0}

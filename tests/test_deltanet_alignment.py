@@ -177,34 +177,26 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-class SyntheticDataset(torch.utils.data.Dataset):
-    """Dummy dataset that returns random token sequences."""
-    def __init__(self, num_samples, seq_length, vocab_size, seed=42):
-        self.num_samples = num_samples
-        self.seq_length = seq_length
-        self.vocab_size = vocab_size
-        self.seed = seed
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        rng = torch.Generator()
-        rng.manual_seed(self.seed + idx)
-        tokens = torch.randint(0, self.vocab_size, (self.seq_length + 1,), generator=rng)
-        return {'text': tokens}
-
-
 def train_valid_test_datasets_provider(train_val_test_num_samples):
-    """Return synthetic datasets so training loop runs."""
+    """Build real train/valid/test datasets (same as pretrain_gpt.py)."""
+    from megatron.data.gpt_dataset import build_train_valid_test_datasets
+    from megatron import print_rank_0
     args = get_args()
-    train_ds = SyntheticDataset(
-        num_samples=train_val_test_num_samples[0],
+    print_rank_0('> building train, validation, and test datasets for alignment test ...')
+    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+        data_prefix=args.data_path,
+        data_impl=args.data_impl,
+        splits_string=args.split,
+        train_valid_test_num_samples=train_val_test_num_samples,
         seq_length=args.seq_length,
-        vocab_size=args.padded_vocab_size,
         seed=args.seed,
-    )
-    return train_ds, None, None
+        skip_warmup=(not args.mmap_warmup),
+        train_data_prefix=args.train_data_path,
+        valid_data_prefix=args.valid_data_path,
+        test_data_prefix=args.test_data_path,
+        data_cache_path=args.data_cache_path)
+    print_rank_0("> finished creating alignment test datasets ...")
+    return train_ds, valid_ds, test_ds
 
 
 def _save_hidden_states():
