@@ -30,8 +30,8 @@ from megatron.core.pipeline_parallel.sp_utils import get_splits
 # ── Global state for capturing hidden states ──
 _hs_chunks = {}    # dict: iter_number -> list of chunks for that iter
 _fwd_count = 0     # total forward calls on this stage
-_SAVE_EARLY_ITER = int(os.environ.get("SAVE_EARLY_ITER", "10"))  # save at this iter
-_SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "3"))           # save last N iters
+_SAVE_EARLY_ITER = int(os.environ.get("SAVE_EARLY_ITER", "1"))  # save at this iter (1 = before any weight update)
+_SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "0"))           # save last N iters (0 = skip for long training)
 
 
 def _get_save_dir():

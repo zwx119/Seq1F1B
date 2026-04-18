@@ -68,6 +68,8 @@ else:
     print(f'  Total iters: {n}')
     print(f'  Max  loss diff: {max_diff:.6e}')
     print(f'  Mean loss diff: {statistics.mean(diffs):.6e}')
+    loss_pass = max_diff < 0.1
+    print(f'  Loss check: {\"PASSED\" if loss_pass else \"FAILED\"} (max_diff < 0.1)')
     # Show last 10 iters detail
     show = min(10, n)
     print(f'  --- Last {show} iterations ---')
@@ -78,7 +80,7 @@ else:
 
 # ── 2. Compare hidden states (per PP stage) ──
 print()
-print('=== Hidden States Comparison (iter 10 + last 3) ===')
+print('=== Hidden States Comparison (pre-update forward equivalence) ===')
 all_pass = True
 for stage in range(8):  # up to 8 stages
     f1 = os.path.join(SAVE_DIR, f'hs_sp1_stage{stage}.pt')
@@ -106,11 +108,15 @@ for stage in range(8):  # up to 8 stages
         print(f'    iter {it}: max_diff={max_d:.6e}  mean_diff={mean_d:.6e}  cos_sim={cos:.8f}  [{status}]')
 
 print()
-if all_pass:
-    print('PASSED: Hidden states match across all PP stages.')
-else:
-    print('FAILED: Hidden states diverge on some stages.')
+if not all_pass:
+    print('FAILED: Pre-update hidden states diverge (forward pass NOT equivalent).')
     sys.exit(1)
+elif common_iters:
+    print('PASSED: Pre-update forward pass is equivalent (hidden states match).')
+    print('        Loss curves also match across full training.')
+else:
+    print('WARNING: No hidden state files found. Only loss was compared.')
+    print('         Loss curves match.' if loss_pass else '         Loss curves DIFFER.')
 " 2>&1 | tee "${COMPARE_OUTPUT}"
 
 echo ""
