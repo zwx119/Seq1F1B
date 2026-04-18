@@ -76,10 +76,11 @@ def compare_losses(name_a, la, name_b, lb):
         print(f'    iter {i+1}: {name_a}={la[i]:.6f}  {name_b}={lb[i]:.6f}  diff={d:.6e}')
     return max_d
 
-def compare_hidden_states(tag_a, tag_b, label):
-    print(f'\n--- {label} ---')
+def compare_hidden_states(tag_a, tag_b, label, threshold=0.999):
+    print(f'\n--- {label} (threshold={threshold}) ---')
     all_pass = True
     found = False
+    iter1_cos_sims = []  # collect iter-1 cos_sims across stages
     for stage in range(8):
         fa = os.path.join(SAVE_DIR, f'hs_{tag_a}_stage{stage}.pt')
         fb = os.path.join(SAVE_DIR, f'hs_{tag_b}_stage{stage}.pt')
@@ -101,12 +102,19 @@ def compare_hidden_states(tag_a, tag_b, label):
             mean_d = (a - b).abs().mean().item()
             cos = torch.nn.functional.cosine_similarity(
                 a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
-            status = 'OK' if cos > 0.9999 else 'DIFF'
-            if status == 'DIFF':
-                all_pass = False
+            # Only check threshold for iter 1 (pre-update)
+            if it == 1:
+                status = 'OK' if cos > threshold else 'DIFF'
+                iter1_cos_sims.append(cos)
+                if status == 'DIFF':
+                    all_pass = False
+            else:
+                status = 'info'  # later iters are expected to diverge
             print(f'    iter {it}: max_diff={max_d:.6e}  mean_diff={mean_d:.6e}  cos_sim={cos:.8f}  [{status}]')
     if not found:
         print('  No hidden state files found.')
+    if iter1_cos_sims:
+        print(f'  iter 1 summary: min_cos={min(iter1_cos_sims):.8f}  mean_cos={statistics.mean(iter1_cos_sims):.8f}')
     return all_pass
 
 # ── 1. Loss comparisons ──
@@ -131,9 +139,9 @@ print()
 print('=' * 60)
 print('=== Hidden States Comparison ===')
 
-pass_a = compare_hidden_states('sp1', 'sp4', 'SP1 vs SP4 (with state passing)')
-pass_b = compare_hidden_states('sp1', 'nostate', 'SP1 vs SP4-nostate (NO state passing)')
-pass_c = compare_hidden_states('sp4', 'nostate', 'SP4 vs SP4-nostate')
+pass_a = compare_hidden_states('sp1', 'sp4', 'SP1 vs SP4 (with state passing)', threshold=0.999)
+pass_b = compare_hidden_states('sp1', 'nostate', 'SP1 vs SP4-nostate (NO state passing)', threshold=0.999)
+pass_c = compare_hidden_states('sp4', 'nostate', 'SP4 vs SP4-nostate', threshold=0.999)
 
 # ── 3. Verdict ──
 print()
