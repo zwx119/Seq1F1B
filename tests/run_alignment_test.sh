@@ -86,14 +86,23 @@ options="${options} \
     --merge-file ${DATA_PATH}/data/merges.txt \
 "
 
-OUTPUT_FILE="${SAVE_DIR}/loss_sp${PP_SP}.txt"
+DISABLE_STATE_PASSING=${DISABLE_STATE_PASSING:-0}
 
-run_cmd="torchrun ${DISTRIBUTED_ARGS} ${DIR}/tests/test_deltanet_alignment.py ${options}"
-echo "====== Alignment Test (PP_SP=${PP_SP}) ======"
+# Tag for output files
+if [ "${DISABLE_STATE_PASSING}" = "1" ]; then
+    TAG="nostate"
+else
+    TAG="sp${PP_SP}"
+fi
+
+OUTPUT_FILE="${SAVE_DIR}/loss_${TAG}.txt"
+
+run_cmd="DISABLE_STATE_PASSING=${DISABLE_STATE_PASSING} torchrun ${DISTRIBUTED_ARGS} ${DIR}/tests/test_deltanet_alignment.py ${options}"
+echo "====== Alignment Test (PP_SP=${PP_SP}, TAG=${TAG}) ======"
 echo "${run_cmd}"
 echo "============================================="
-eval ${run_cmd} 2>&1 | tee "${SAVE_DIR}/log_sp${PP_SP}.txt"
+eval ${run_cmd} 2>&1 | tee "${SAVE_DIR}/log_${TAG}.txt"
 
 # Extract loss from log
-grep "lm loss" "${SAVE_DIR}/log_sp${PP_SP}.txt" > "${OUTPUT_FILE}" || true
+grep "lm loss" "${SAVE_DIR}/log_${TAG}.txt" > "${OUTPUT_FILE}" || true
 echo "Loss saved to ${OUTPUT_FILE}"

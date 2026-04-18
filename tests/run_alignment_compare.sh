@@ -23,7 +23,13 @@ PP_SP=4 MASTER_PORT=29501 bash "${DIR}/tests/run_alignment_test.sh"
 
 echo ""
 echo "======================================================"
-echo "  Step 3: Comparing losses"
+echo "  Step 3: Running ablation (PP_SP=4, NO state passing)"
+echo "======================================================"
+PP_SP=4 DISABLE_STATE_PASSING=1 MASTER_PORT=29502 bash "${DIR}/tests/run_alignment_test.sh"
+
+echo ""
+echo "======================================================"
+echo "  Step 4: Comparing results"
 echo "======================================================"
 echo "--- PP_SP=1 (baseline) last 20 lines ---"
 tail -20 "${SAVE_DIR}/loss_sp1.txt"
@@ -31,17 +37,22 @@ echo ""
 echo "--- PP_SP=4 (Seq1F1B) last 20 lines ---"
 tail -20 "${SAVE_DIR}/loss_sp4.txt"
 echo ""
+echo "--- PP_SP=4 no-state (ablation) last 20 lines ---"
+tail -20 "${SAVE_DIR}/loss_nostate.txt"
+echo ""
 
 # Simple Python comparison — save results to file
 COMPARE_OUTPUT="${SAVE_DIR}/compare_result.txt"
 python3 -c "
-import re, sys, os, torch
+import re, sys, os, torch, statistics
 
 SAVE_DIR = '${SAVE_DIR}'
 
-# ── 1. Compare losses ──
+# ── Helper ──
 def parse_losses(filename):
     losses = []
+    if not os.path.exists(filename):
+        return losses
     with open(filename) as f:
         for line in f:
             m = re.search(r'lm loss[:\s]+([\d.eE+-]+)', line)
@@ -49,74 +60,92 @@ def parse_losses(filename):
                 losses.append(float(m.group(1)))
     return losses
 
+def compare_losses(name_a, la, name_b, lb):
+    n = min(len(la), len(lb))
+    if n == 0:
+        print(f'  WARNING: no losses to compare for {name_a} vs {name_b}')
+        return
+    diffs = [abs(la[i] - lb[i]) for i in range(n)]
+    max_d = max(diffs)
+    mean_d = statistics.mean(diffs)
+    status = 'PASSED' if max_d < 0.1 else 'FAILED'
+    print(f'  {name_a} vs {name_b}: {n} iters, max_diff={max_d:.6e}, mean_diff={mean_d:.6e} [{status}]')
+    # Last 5 iters
+    for i in range(max(0, n-5), n):
+        d = abs(la[i] - lb[i])
+        print(f'    iter {i+1}: {name_a}={la[i]:.6f}  {name_b}={lb[i]:.6f}  diff={d:.6e}')
+    return max_d
+
+def compare_hidden_states(tag_a, tag_b, label):
+    print(f'\n--- {label} ---')
+    all_pass = True
+    found = False
+    for stage in range(8):
+        fa = os.path.join(SAVE_DIR, f'hs_{tag_a}_stage{stage}.pt')
+        fb = os.path.join(SAVE_DIR, f'hs_{tag_b}_stage{stage}.pt')
+        if not os.path.exists(fa) or not os.path.exists(fb):
+            continue
+        found = True
+        ha = torch.load(fa, map_location='cpu')
+        hb = torch.load(fb, map_location='cpu')
+        common = sorted(set(ha.keys()) & set(hb.keys()))
+        print(f'  PP Stage {stage}: iters {common}')
+        for it in common:
+            a = ha[it].float()
+            b = hb[it].float()
+            if a.shape != b.shape:
+                print(f'    iter {it}: SHAPE MISMATCH {a.shape} vs {b.shape}')
+                all_pass = False
+                continue
+            max_d = (a - b).abs().max().item()
+            mean_d = (a - b).abs().mean().item()
+            cos = torch.nn.functional.cosine_similarity(
+                a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+            status = 'OK' if cos > 0.9999 else 'DIFF'
+            if status == 'DIFF':
+                all_pass = False
+            print(f'    iter {it}: max_diff={max_d:.6e}  mean_diff={mean_d:.6e}  cos_sim={cos:.8f}  [{status}]')
+    if not found:
+        print('  No hidden state files found.')
+    return all_pass
+
+# ── 1. Loss comparisons ──
 l1 = parse_losses(os.path.join(SAVE_DIR, 'loss_sp1.txt'))
 l4 = parse_losses(os.path.join(SAVE_DIR, 'loss_sp4.txt'))
+lns = parse_losses(os.path.join(SAVE_DIR, 'loss_nostate.txt'))
 
-if not l1 or not l4:
-    print('WARNING: Could not parse losses. Check log files manually.')
-else:
-    n = min(len(l1), len(l4))
-    print(f'=== Loss Comparison ({n} iterations) ===')
-    max_diff = 0
-    diffs = []
-    for i in range(n):
-        diff = abs(l1[i] - l4[i])
-        max_diff = max(max_diff, diff)
-        diffs.append(diff)
-    # Summary
-    import statistics
-    print(f'  Total iters: {n}')
-    print(f'  Max  loss diff: {max_diff:.6e}')
-    print(f'  Mean loss diff: {statistics.mean(diffs):.6e}')
-    loss_pass = max_diff < 0.1
-    print(f'  Loss check: {\"PASSED\" if loss_pass else \"FAILED\"} (max_diff < 0.1)')
-    # Show last 10 iters detail
-    show = min(10, n)
-    print(f'  --- Last {show} iterations ---')
-    for i in range(n - show, n):
-        diff = abs(l1[i] - l4[i])
-        status = 'OK' if diff < 0.01 else 'DIFF'
-        print(f'  iter {i+1}: SP1={l1[i]:.6f}  SP4={l4[i]:.6f}  diff={diff:.6e}  [{status}]')
-
-# ── 2. Compare hidden states (per PP stage) ──
+print('=' * 60)
+print('=== Loss Comparison ===')
 print()
-print('=== Hidden States Comparison (pre-update forward equivalence) ===')
-all_pass = True
-for stage in range(8):  # up to 8 stages
-    f1 = os.path.join(SAVE_DIR, f'hs_sp1_stage{stage}.pt')
-    f4 = os.path.join(SAVE_DIR, f'hs_sp4_stage{stage}.pt')
-    if not os.path.exists(f1) or not os.path.exists(f4):
-        continue
-    hs1 = torch.load(f1, map_location='cpu')  # dict: iter_num -> tensor
-    hs4 = torch.load(f4, map_location='cpu')
-    common_iters = sorted(set(hs1.keys()) & set(hs4.keys()))
-    print(f'  PP Stage {stage}: comparing iters {common_iters}')
-    for it in common_iters:
-        h1 = hs1[it].float()
-        h4 = hs4[it].float()
-        if h1.shape != h4.shape:
-            print(f'    iter {it}: SHAPE MISMATCH {h1.shape} vs {h4.shape}')
-            all_pass = False
-            continue
-        max_d = (h1 - h4).abs().max().item()
-        mean_d = (h1 - h4).abs().mean().item()
-        cos = torch.nn.functional.cosine_similarity(
-            h1.flatten().unsqueeze(0), h4.flatten().unsqueeze(0)).item()
-        status = 'OK' if cos > 0.9999 else 'DIFF'
-        if status == 'DIFF':
-            all_pass = False
-        print(f'    iter {it}: max_diff={max_d:.6e}  mean_diff={mean_d:.6e}  cos_sim={cos:.8f}  [{status}]')
-
+print('[A] SP1 (baseline) vs SP4 (Seq1F1B with state passing):')
+compare_losses('SP1', l1, 'SP4', l4)
 print()
-if not all_pass:
-    print('FAILED: Pre-update hidden states diverge (forward pass NOT equivalent).')
-    sys.exit(1)
-elif common_iters:
-    print('PASSED: Pre-update forward pass is equivalent (hidden states match).')
-    print('        Loss curves also match across full training.')
+print('[B] SP1 (baseline) vs SP4-nostate (NO state passing):')
+compare_losses('SP1', l1, 'nostate', lns)
+print()
+print('[C] SP4 (with state) vs SP4-nostate (without state):')
+compare_losses('SP4', l4, 'nostate', lns)
+
+# ── 2. Hidden states comparisons ──
+print()
+print('=' * 60)
+print('=== Hidden States Comparison ===')
+
+pass_a = compare_hidden_states('sp1', 'sp4', 'SP1 vs SP4 (with state passing)')
+pass_b = compare_hidden_states('sp1', 'nostate', 'SP1 vs SP4-nostate (NO state passing)')
+pass_c = compare_hidden_states('sp4', 'nostate', 'SP4 vs SP4-nostate')
+
+# ── 3. Verdict ──
+print()
+print('=' * 60)
+if pass_a:
+    print('PASSED: SP1 vs SP4 hidden states match → Seq1F1B forward is equivalent.')
 else:
-    print('WARNING: No hidden state files found. Only loss was compared.')
-    print('         Loss curves match.' if loss_pass else '         Loss curves DIFFER.')
+    print('FAILED: SP1 vs SP4 hidden states diverge.')
+if not pass_b:
+    print('EXPECTED: SP1 vs nostate hidden states differ → state passing IS necessary.')
+else:
+    print('UNEXPECTED: SP1 vs nostate match → state passing has no effect?!')
 " 2>&1 | tee "${COMPARE_OUTPUT}"
 
 echo ""

@@ -162,12 +162,18 @@ def loss_func(loss_mask, output_tensor):
     return loss, {'lm loss': averaged_loss[0]}
 
 
+# Whether to disable state passing between SP chunks (ablation)
+_DISABLE_STATE_PASSING = os.environ.get("DISABLE_STATE_PASSING", "0") == "1"
+
+
 def forward_step(data_iterator, model):
     """Forward step with SP data splitting."""
     from functools import partial
     tokens, labels, loss_mask, attention_mask, position_ids, offset = _get_batch_sp(data_iterator)
+    # Ablation: force micro_sp_idx=0 for every chunk → no state passing
+    effective_offset = 0 if _DISABLE_STATE_PASSING else offset
     output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels, micro_sp_idx=offset)
+                          labels=labels, micro_sp_idx=effective_offset)
     return output_tensor, partial(loss_func, loss_mask)
 
 
@@ -216,11 +222,12 @@ def _save_hidden_states():
             combined = torch.cat(chunks, dim=0)  # [s_full, b, h]
             hs_dict[iter_num] = combined
 
-    save_path = os.path.join(save_dir, f"hs_sp{sp}_stage{rank}.pt")
+    tag = "nostate" if _DISABLE_STATE_PASSING else f"sp{sp}"
+    save_path = os.path.join(save_dir, f"hs_{tag}_stage{rank}.pt")
     torch.save(hs_dict, save_path)
     saved_iters = sorted(hs_dict.keys())
     print(f"[Stage {rank}] Saved iters {saved_iters} "
-          f"(sp={sp}) to {save_path}")
+          f"({tag}) to {save_path}")
 
     dist.barrier()
 
