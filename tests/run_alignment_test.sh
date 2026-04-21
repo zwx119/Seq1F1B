@@ -57,7 +57,6 @@ options=" \
     --deltanet-conv-size 4 \
     --deltanet-qk-activation silu \
     --deltanet-qk-norm l2 \
-    --deltanet-use-short-conv \
     --deltanet-use-beta \
     --bf16 \
     --untie-embeddings-and-output-weights \
@@ -89,17 +88,33 @@ options="${options} \
 "
 
 DISABLE_STATE_PASSING=${DISABLE_STATE_PASSING:-0}
+NO_SHORT_CONV=${NO_SHORT_CONV:-0}
+
+# Short conv flag
+if [ "${NO_SHORT_CONV}" = "1" ]; then
+    options="${options} --no-deltanet-short-conv"
+else
+    options="${options} --deltanet-use-short-conv"
+fi
 
 # Tag for output files
 if [ "${DISABLE_STATE_PASSING}" = "1" ]; then
     TAG="nostate"
+elif [ "${NO_SHORT_CONV}" = "1" ]; then
+    TAG="sp${PP_SP}_noconv"
 else
     TAG="sp${PP_SP}"
 fi
 
 OUTPUT_FILE="${SAVE_DIR}/loss_${TAG}.txt"
 
-run_cmd="DISABLE_STATE_PASSING=${DISABLE_STATE_PASSING} torchrun ${DISTRIBUTED_ARGS} ${DIR}/tests/test_deltanet_alignment.py ${options}"
+# Forward any extra CLI args (e.g. --fp32, --dump-layer-stats) from the
+# caller (run_noconv_compare.sh / run_alignment_compare.sh) to the python
+# script. Without this, flags injected by the outer script never reach
+# test_deltanet_alignment.py.
+EXTRA_PY_ARGS="$*"
+
+run_cmd="DISABLE_STATE_PASSING=${DISABLE_STATE_PASSING} torchrun ${DISTRIBUTED_ARGS} ${DIR}/tests/test_deltanet_alignment.py ${options} ${EXTRA_PY_ARGS}"
 echo "====== Alignment Test (PP_SP=${PP_SP}, TAG=${TAG}) ======"
 echo "${run_cmd}"
 echo "============================================="
