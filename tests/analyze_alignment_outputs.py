@@ -175,7 +175,7 @@ def main():
     p.add_argument('--dir', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'alignment_outputs'))
     p.add_argument('--tag-a', default='sp1_noconv', help='reference run tag')
     p.add_argument('--tag-b', default='sp4_noconv', help='comparison run tag')
-    p.add_argument('--iters', type=int, nargs='*', default=[1, 10],
+    p.add_argument('--iters', type=int, nargs='*', default=[1, 2],
                    help='only analyze these iters (default 1 10)')
     p.add_argument('--cos-threshold', type=float, default=0.999)
     p.add_argument('--topk', type=int, default=5)

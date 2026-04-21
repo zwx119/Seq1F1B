@@ -19,6 +19,12 @@ import torch.distributed as dist
 from collections import deque
 import argparse
 
+# Ensure repo root is on sys.path so `megatron` can be imported when this
+# script is launched directly by torchrun (sys.path[0] is tests/).
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from megatron import get_args, print_rank_0
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.enums import ModelType
@@ -32,7 +38,7 @@ from megatron.core.pipeline_parallel.sp_utils import get_splits
 _hs_chunks = {}    # dict: iter_number -> list of chunks for that iter
 _fwd_count = 0     # total forward calls on this stage
 _SAVE_EARLY_ITER = int(os.environ.get("SAVE_EARLY_ITER", "1"))  # save at this iter (1 = before any weight update)
-_SAVE_SECOND_ITER = int(os.environ.get("SAVE_SECOND_ITER", "10"))  # also save at this iter
+_SAVE_SECOND_ITER = int(os.environ.get("SAVE_SECOND_ITER", "2"))  # also save at this iter
 _SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "3"))           # save last N iters
 # For layer-level stats dumping
 _pre_fwd_count = 0

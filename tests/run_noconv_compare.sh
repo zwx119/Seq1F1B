@@ -47,6 +47,7 @@ python3 "${DIR}/tests/analyze_alignment_outputs.py" \
     --dir "${SAVE_DIR}" \
     --tag-a sp1_noconv \
     --tag-b sp4_noconv \
+    --iters 1 2 \
     2>&1 | tee "${SAVE_DIR}/compare_noconv_result.txt"
 
 echo ""
