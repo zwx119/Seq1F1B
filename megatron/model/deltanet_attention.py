@@ -459,12 +459,29 @@ class DeltaNetAttention(MegatronModule):
             # Seq1F1B path: use DeltaNetChunkFunc with backward state gradient relay.
             # State is read/written via self.state_cache dict internally,
             # NOT passed as tensor args (to avoid autograd edges between chunks).
+            # chunk kernels currently only support bfloat16. If the caller
+            # requested full fp32 (via --fp32) we keep model params in fp32
+            # but cast the q/k/v/beta tensors to bfloat16 for the chunk
+            # kernel, then cast the output back to fp32 to preserve caller
+            # expectations.
+            orig_dtype = q.dtype
+            needs_cast = (orig_dtype == torch.float32)
+            if needs_cast:
+                q_kv_dtype = torch.bfloat16
+                q = q.to(q_kv_dtype)
+                k = k.to(q_kv_dtype)
+                v = v.to(q_kv_dtype)
+                beta = beta.to(q_kv_dtype)
+
             o = DeltaNetChunkFunc.apply(
                 q, k, v, beta,
                 self.head_dim ** -0.5,
                 self.state_cache,
                 (self.qk_norm == 'l2'),
             )
+
+            if needs_cast:
+                o = o.to(orig_dtype)
             # recurrent_state is now in self.state_cache['recurrent_state']
         elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_delta_rule(
@@ -476,12 +493,33 @@ class DeltaNetAttention(MegatronModule):
             if output_final_state and recurrent_state is not None:
                 self.state_cache['recurrent_state'] = recurrent_state.detach()
         elif mode == 'chunk':
+            # chunk_delta_rule currently enforces bfloat16 inputs. If the
+            # model was constructed in fp32 mode, cast q/k/v/beta to bfloat16
+            # for this call and cast outputs back to fp32 afterward.
+            orig_dtype = q.dtype
+            needs_cast = (orig_dtype == torch.float32)
+            if needs_cast:
+                q_kv_dtype = torch.bfloat16
+                q = q.to(q_kv_dtype)
+                k = k.to(q_kv_dtype)
+                v = v.to(q_kv_dtype)
+                beta = beta.to(q_kv_dtype)
+
             o, recurrent_state = chunk_delta_rule(
                 q=q, k=k, v=v, beta=beta,
                 initial_state=initial_state,
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
             )
+
+            if needs_cast:
+                o = o.to(orig_dtype)
+                if recurrent_state is not None:
+                    # recurrent_state may be tensor or dict; if tensor, cast
+                    try:
+                        recurrent_state = recurrent_state.to(orig_dtype)
+                    except Exception:
+                        pass
         else:
             raise NotImplementedError(f"DeltaNet mode `{mode}` not supported.")
 
