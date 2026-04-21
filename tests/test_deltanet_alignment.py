@@ -34,6 +34,11 @@ _fwd_count = 0     # total forward calls on this stage
 _SAVE_EARLY_ITER = int(os.environ.get("SAVE_EARLY_ITER", "1"))  # save at this iter (1 = before any weight update)
 _SAVE_SECOND_ITER = int(os.environ.get("SAVE_SECOND_ITER", "10"))  # also save at this iter
 _SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "3"))           # save last N iters
+# For layer-level stats dumping
+_pre_fwd_count = 0
+_current_fwd_meta = {}  # populated by encoder pre-hook: {'cur_train_iter':int, 'micro_idx':int, 'chunk_idx':int}
+layer_forward_stats = {}  # iter -> layer_idx -> list of stats dicts
+layer_grad_stats = {}     # iter -> layer_idx -> list of grad norm floats
 
 
 def _get_save_dir():
@@ -60,20 +65,31 @@ def model_provider(pre_process=True, post_process=True):
     encoder = model.language_model.encoder
 
     def _capture_hook(module, input, output):
-        """Capture encoder output at specific iterations only."""
-        global _fwd_count
+        """Capture encoder output at specific iterations only.
+
+        Uses metadata populated by the encoder pre-forward hook so that
+        per-layer hooks can rely on the same iteration/microbatch values.
+        """
         args = get_args()
         sp = args.pipe_sp_splits
         num_micro = args.global_batch_size // args.micro_batch_size
         fwd_per_iter = sp * num_micro  # total forward calls per training iteration
 
-        _fwd_count += 1
-        # Which training iteration is this? (1-indexed)
-        cur_train_iter = (_fwd_count - 1) // fwd_per_iter + 1
-        # Which microbatch within this iteration?
-        within_iter = (_fwd_count - 1) % fwd_per_iter
-        micro_idx = within_iter // sp
-        chunk_idx = within_iter % sp
+        # If the pre-hook populated metadata, use that; otherwise, fall back
+        # to computing based on a local counter.
+        meta = _current_fwd_meta.get('meta') if isinstance(_current_fwd_meta.get('meta'), dict) else None
+        if meta is not None:
+            cur_train_iter = meta['cur_train_iter']
+            micro_idx = meta['micro_idx']
+            chunk_idx = meta['chunk_idx']
+        else:
+            # Fallback: increment shared counter (older behavior)
+            global _fwd_count
+            _fwd_count += 1
+            cur_train_iter = (_fwd_count - 1) // fwd_per_iter + 1
+            within_iter = (_fwd_count - 1) % fwd_per_iter
+            micro_idx = within_iter // sp
+            chunk_idx = within_iter % sp
 
         # Only capture the FIRST microbatch of each iteration (micro_idx == 0)
         if micro_idx != 0:
@@ -94,6 +110,76 @@ def model_provider(pre_process=True, post_process=True):
                     del _hs_chunks[k]
 
     encoder.register_forward_hook(_capture_hook)
+    # Pre-forward hook on encoder to populate iteration metadata before
+    # layer-level forward hooks run. This lets layer hooks know which
+    # training iteration and microbatch they belong to.
+    def _pre_hook(module, input):
+        global _pre_fwd_count
+        args = get_args()
+        sp = args.pipe_sp_splits
+        num_micro = args.global_batch_size // args.micro_batch_size
+        fwd_per_iter = sp * num_micro
+
+        _pre_fwd_count += 1
+        cur_train_iter = (_pre_fwd_count - 1) // fwd_per_iter + 1
+        within_iter = (_pre_fwd_count - 1) % fwd_per_iter
+        micro_idx = within_iter // sp
+        chunk_idx = within_iter % sp
+        _current_fwd_meta['meta'] = {
+            'cur_train_iter': cur_train_iter,
+            'micro_idx': micro_idx,
+            'chunk_idx': chunk_idx,
+        }
+
+    encoder.register_forward_pre_hook(_pre_hook)
+
+    # Optionally register per-layer hooks to dump forward and grad stats.
+    args = get_args()
+    if getattr(args, 'dump_layer_stats', False):
+        # For each transformer layer, register a forward hook that records
+        # simple statistics (norm, mean, max) of the layer output when
+        # the microbatch is the first microbatch of an iteration, and
+        # only for the early and second iteration we care about.
+        for li, layer in enumerate(getattr(encoder, 'layers', [])):
+            def make_layer_hook(layer_idx):
+                def _layer_hook(module, input, output):
+                    meta = _current_fwd_meta.get('meta')
+                    if meta is None:
+                        return
+                    cur_train_iter = meta['cur_train_iter']
+                    micro_idx = meta['micro_idx']
+                    # Only capture the first microbatch of each iter
+                    if micro_idx != 0:
+                        return
+                    # Only capture the two iters we care about
+                    if cur_train_iter not in (_SAVE_EARLY_ITER, _SAVE_SECOND_ITER):
+                        return
+
+                    # compute stats
+                    out = output.detach()
+                    stats = {
+                        'norm': out.float().norm().item(),
+                        'mean': out.float().mean().item(),
+                        'maxabs': out.float().abs().max().item(),
+                    }
+                    layer_forward_stats.setdefault(cur_train_iter, {}).setdefault(layer_idx, []).append(stats)
+
+                    # register a backward hook to capture grad norms for this
+                    # output tensor when backward runs
+                    def _save_grad(grad):
+                        try:
+                            gnorm = grad.detach().float().norm().item()
+                        except Exception:
+                            gnorm = None
+                        layer_grad_stats.setdefault(cur_train_iter, {}).setdefault(layer_idx, []).append(gnorm)
+
+                    if isinstance(output, torch.Tensor) and output.requires_grad:
+                        try:
+                            output.register_hook(_save_grad)
+                        except Exception:
+                            pass
+                return _layer_hook
+            layer.register_forward_hook(make_layer_hook(li))
 
     return model
 
@@ -223,6 +309,22 @@ def _save_hidden_states():
           f"({tag}) to {save_path}")
 
     dist.barrier()
+    # Also save per-layer forward/grad stats if collected
+    if layer_forward_stats or layer_grad_stats:
+        stats_path = os.path.join(save_dir, f"layer_stats_{tag}_stage{rank}.pt")
+        torch.save({'forward': layer_forward_stats, 'grad': layer_grad_stats}, stats_path)
+        print(f"[Stage {rank}] Saved layer stats to {stats_path}")
+
+    # If we have both early and second iter hidden states, print a small diff summary
+    try:
+        if _SAVE_EARLY_ITER in hs_dict and _SAVE_SECOND_ITER in hs_dict:
+            a = hs_dict[_SAVE_EARLY_ITER]
+            b = hs_dict[_SAVE_SECOND_ITER]
+            # compute simple norms of difference
+            diff = (a - b).float()
+            print(f"[Stage {rank}] Early vs Second iter hidden states diff: norm={diff.norm().item():.6f}, mean_abs={diff.abs().mean().item():.6e}")
+    except Exception:
+        pass
 
 
 # ── Monkey-patch pretrain to save hidden states after training ──
@@ -235,6 +337,7 @@ def _patched_pretrain(*args, **kwargs):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--fp32', action='store_true', help='Use fp32 precision')
+    parser.add_argument('--dump-layer-stats', action='store_true', help='Dump per-layer forward and grad stats for first two iters')
     # Parse known args to avoid interfering with Megatron's own parser
     args, unknown = parser.parse_known_args()
     # Ensure megatron's global parser knows about --fp32 too by providing
@@ -243,6 +346,7 @@ if __name__ == "__main__":
     # initialize_megatron (which runs in each spawned process).
     def _extra_args_provider(parser):
         parser.add_argument('--fp32', action='store_true', help='Use fp32 precision')
+        parser.add_argument('--dump-layer-stats', action='store_true', help='Dump per-layer forward and grad stats for first two iters')
         return parser
 
     # Optionally, you can set a global flag or patch get_args() if needed
