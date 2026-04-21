@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-分析 alignment_outputs 目录：
-- 对比 hs_sp1_stageX.pt vs hs_sp4_stageX.pt 以找到每个 PP stage 最早发散的迭代（cos_sim < threshold）
-- 尝试加载 layer_stats_{tag}_stage{rank}.pt 并报告 iter1->iter2 输出梯度放大最多的层
+Compare two runs (e.g. sp1_noconv vs sp4_noconv) per PP stage / layer to
+locate the first layer where forward or backward diverges.
 
-用法示例：
-  python3 tests/analyze_alignment_outputs.py --dir tests/alignment_outputs --threshold 0.999 --topk 10
+Inputs (default dir: tests/alignment_outputs):
+  hs_{tag}_stage{rank}.pt          full encoder output hidden states
+  layer_outs_{tag}_stage{rank}.pt  per-layer outputs: iter -> layer -> [s,b,h]
+  layer_stats_{tag}_stage{rank}.pt per-layer stats: {'forward': ..., 'grad': {iter: {layer: [norms]}}}
 
-输出为终端友好报告，便于下一步定位可疑层。
+Usage:
+  python3 tests/analyze_alignment_outputs.py \
+      --tag-a sp1_noconv --tag-b sp4_noconv \
+      --iters 1 10 --cos-threshold 0.999 --topk 5
 """
 import argparse
-import glob
-import os
-import torch
 import math
-from collections import defaultdict
+import os
+
+import torch
 
 
 def cos_sim(a, b):
@@ -23,168 +26,171 @@ def cos_sim(a, b):
     denom = (a.norm() * b.norm()).item()
     if denom == 0:
         return float('nan')
-    return torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+    return (a @ b).item() / denom
 
 
-def find_hs_files(d):
-    hs_files = defaultdict(dict)  # hs_files[tag][stage]=path
-    for p in glob.glob(os.path.join(d, 'hs_*_stage*.pt')):
-        base = os.path.basename(p)
-        # hs_{tag}_stage{rank}.pt
-        parts = base.split('_')
-        if len(parts) < 3:
-            continue
-        tag = '_'.join(parts[1:-1])
-        stage_part = parts[-1]
-        if not stage_part.startswith('stage'):
-            continue
-        try:
-            stage = int(stage_part.replace('stage', '').replace('.pt',''))
-        except Exception:
-            continue
-        hs_files[tag][stage] = p
-    return hs_files
+def max_abs_diff(a, b):
+    return (a.float() - b.float()).abs().max().item()
 
 
-def analyze_hidden_states(d, threshold=0.999):
-    hs_files = find_hs_files(d)
-    # We expect tags like sp1, sp4, nostate, sp1_noconv, sp4_noconv
-    report = {}
-    for stage in range(0, 32):
-        # find pair sp1 vs sp4 for this stage
-        a = hs_files.get('sp1', {}).get(stage)
-        b = hs_files.get('sp4', {}).get(stage)
-        if not a or not b:
-            continue
-        ha = torch.load(a, map_location='cpu')
-        hb = torch.load(b, map_location='cpu')
+def mean_abs_diff(a, b):
+    return (a.float() - b.float()).abs().mean().item()
+
+
+def find_stage_files(d, pattern):
+    out = {}
+    for rank in range(32):
+        p = os.path.join(d, pattern.replace('{rank}', str(rank)))
+        if os.path.exists(p):
+            out[rank] = p
+    return out
+
+
+def compare_hidden_states(d, tag_a, tag_b, iters_of_interest, cos_threshold):
+    print('\n' + '=' * 70)
+    print("=== Encoder output (hs_*): {}  vs  {}".format(tag_a, tag_b))
+    print('=' * 70)
+    stages_a = find_stage_files(d, 'hs_{}_stage{{rank}}.pt'.format(tag_a))
+    stages_b = find_stage_files(d, 'hs_{}_stage{{rank}}.pt'.format(tag_b))
+    stages = sorted(set(stages_a) & set(stages_b))
+    if not stages:
+        print("  (No hs files found for tags {} / {})".format(tag_a, tag_b))
+        return
+    for s in stages:
+        ha = torch.load(stages_a[s], map_location='cpu')
+        hb = torch.load(stages_b[s], map_location='cpu')
         common = sorted(set(ha.keys()) & set(hb.keys()))
-        if not common:
-            continue
-        first_bad = None
-        sims = {}
+        print("\n  PP Stage {}: common iters = {}".format(s, common))
         for it in common:
-            aa = ha[it].float()
-            bb = hb[it].float()
-            if aa.numel() != bb.numel():
-                sims[it] = float('nan')
+            if iters_of_interest and it not in iters_of_interest:
                 continue
-            sims[it] = cos_sim(aa, bb)
-            if it > 1 and first_bad is None and (not math.isnan(sims[it])) and sims[it] < threshold:
-                first_bad = it
-        report[stage] = {'common_iters': common, 'cos_sims': sims, 'first_bad': first_bad, 'path_sp1': a, 'path_sp4': b}
-    return report
+            a, b = ha[it], hb[it]
+            if a.shape != b.shape:
+                print("    iter {}: SHAPE MISMATCH {} vs {}".format(it, a.shape, b.shape))
+                continue
+            cs = cos_sim(a, b)
+            md = max_abs_diff(a, b)
+            mn = mean_abs_diff(a, b)
+            status = 'OK' if cs > cos_threshold else 'DIFF'
+            print("    iter {}: cos_sim={:.8f}  max_diff={:.3e}  mean_diff={:.3e}  [{}]".format(it, cs, md, mn, status))
 
 
-def try_extract_grad_stats(obj):
-    """
-    尝试从加载的 layer_stats 对象中提取每层在各 iter 的输出梯度范数信息。
-    支持多种常见命名：layer_grad_stats, layer_grad_norms, grad_stats 等。
-    返回 {layer_idx: {iter: value}}
-    """
-    # If obj is a tensor/dict directly mapping, try to detect structure
-    if isinstance(obj, dict):
-        # common key names
-        for key in ['layer_grad_stats', 'layer_grad_norms', 'layer_grad', 'layer_stats']:
-            if key in obj:
-                candidate = obj[key]
-                # expect candidate to be dict-like
-                if isinstance(candidate, dict):
-                    return candidate
-        # fallback: if keys look like 'layer_0', 'layer_1'
-        layer_map = {}
-        for k, v in obj.items():
-            if isinstance(k, str) and k.startswith('layer'):
-                layer_map[k] = v
-        if layer_map:
-            return layer_map
-    # give up
-    return None
+def compare_layer_outs(d, tag_a, tag_b, iters_of_interest, cos_threshold):
+    print('\n' + '=' * 70)
+    print("=== Per-layer forward outputs (layer_outs_*): {}  vs  {}".format(tag_a, tag_b))
+    print('=' * 70)
+    stages_a = find_stage_files(d, 'layer_outs_{}_stage{{rank}}.pt'.format(tag_a))
+    stages_b = find_stage_files(d, 'layer_outs_{}_stage{{rank}}.pt'.format(tag_b))
+    stages = sorted(set(stages_a) & set(stages_b))
+    if not stages:
+        print("  (No layer_outs files. Re-run with --dump-layer-stats to generate them.)")
+        return
+
+    first_div_global = None
+    for s in stages:
+        la = torch.load(stages_a[s], map_location='cpu')
+        lb = torch.load(stages_b[s], map_location='cpu')
+        common_iters = sorted(set(la.keys()) & set(lb.keys()))
+        if not common_iters:
+            continue
+        print("\n  PP Stage {}: iters = {}".format(s, common_iters))
+
+        for it in common_iters:
+            if iters_of_interest and it not in iters_of_interest:
+                continue
+            pla = la[it]
+            plb = lb[it]
+            common_layers = sorted(set(pla.keys()) & set(plb.keys()))
+            print("    --- iter {}: {} layers ---".format(it, len(common_layers)))
+            first_bad_layer = None
+            for li in common_layers:
+                a, b = pla[li], plb[li]
+                if a.shape != b.shape:
+                    print("      layer {:>3}: SHAPE MISMATCH {} vs {}".format(li, tuple(a.shape), tuple(b.shape)))
+                    continue
+                cs = cos_sim(a, b)
+                md = max_abs_diff(a, b)
+                mn = mean_abs_diff(a, b)
+                is_bad = (not math.isnan(cs)) and cs < cos_threshold
+                st = 'DIFF' if is_bad else 'OK'
+                print("      layer {:>3}: cos_sim={:.8f}  max_diff={:.3e}  mean_diff={:.3e}  [{}]".format(li, cs, md, mn, st))
+                if is_bad and first_bad_layer is None:
+                    first_bad_layer = li
+
+            if first_bad_layer is not None:
+                print("    >> Stage {}, iter {}: first diverging layer = layer {}".format(s, it, first_bad_layer))
+                if first_div_global is None:
+                    first_div_global = (s, first_bad_layer, it)
+
+    if first_div_global is not None:
+        s, li, it = first_div_global
+        print("\n*** Global first divergence: stage={}, layer={}, iter={} ***".format(s, li, it))
+    else:
+        print("\n*** All layers cos_sim > {}; no forward divergence detected ***".format(cos_threshold))
 
 
-def analyze_layer_stats(d, tag='sp4', stage=0, topk=10):
-    pattern = os.path.join(d, f'layer_stats_{tag}_stage{stage}.pt')
-    if not os.path.exists(pattern):
-        return None
-    obj = torch.load(pattern, map_location='cpu')
-    extracted = try_extract_grad_stats(obj)
-    if extracted is None:
-        return {'raw_keys': list(obj.keys())}
-    # normalize to {layer_idx: {iter: val}}
-    normalized = {}
-    for lk, lv in extracted.items():
-        # layer key may be int or '0' or 'layer_0'
-        try:
-            lid = int(lk) if not isinstance(lk, int) else lk
-        except Exception:
-            # try to parse digits
-            import re
-            m = re.search(r'(\d+)', str(lk))
-            if m:
-                lid = int(m.group(1))
-            else:
-                lid = str(lk)
-        # lv might be dict of iters or a list
-        if isinstance(lv, dict):
-            normalized[lid] = {int(it): float(val) for it, val in lv.items()}
-        elif isinstance(lv, (list, tuple)):
-            normalized[lid] = {i+1: float(v) for i, v in enumerate(lv)}
-        elif torch.is_tensor(lv):
-            arr = lv.cpu().numpy()
-            normalized[lid] = {i+1: float(x) for i, x in enumerate(arr)}
-        else:
-            # single number
-            try:
-                normalized[lid] = {1: float(lv)}
-            except Exception:
-                normalized[lid] = { 'raw': lv }
+def compare_grad_norms(d, tag_a, tag_b, iters_of_interest, topk):
+    print('\n' + '=' * 70)
+    print("=== Per-layer grad norm ratio (layer_stats_*): {}  vs  {}".format(tag_a, tag_b))
+    print('=' * 70)
+    stages_a = find_stage_files(d, 'layer_stats_{}_stage{{rank}}.pt'.format(tag_a))
+    stages_b = find_stage_files(d, 'layer_stats_{}_stage{{rank}}.pt'.format(tag_b))
+    stages = sorted(set(stages_a) & set(stages_b))
+    if not stages:
+        print("  (No layer_stats files.)")
+        return
 
-    # compute ratio iter2/iter1 where possible
-    ratios = []
-    for lid, series in normalized.items():
-        if 1 in series and 2 in series and series[1] != 0:
-            ratio = series[2] / series[1]
-            ratios.append((lid, ratio, series[1], series[2]))
-    ratios.sort(key=lambda x: abs(x[1]), reverse=True)
-    return {'normalized': normalized, 'ratios_topk': ratios[:topk]}
+    for s in stages:
+        sa = torch.load(stages_a[s], map_location='cpu')
+        sb = torch.load(stages_b[s], map_location='cpu')
+        ga = sa.get('grad', {}) if isinstance(sa, dict) else {}
+        gb = sb.get('grad', {}) if isinstance(sb, dict) else {}
+        common_iters = sorted(set(ga.keys()) & set(gb.keys()))
+        if not common_iters:
+            print("\n  PP Stage {}: no grad records".format(s))
+            continue
+        print("\n  PP Stage {}:".format(s))
+        for it in common_iters:
+            if iters_of_interest and it not in iters_of_interest:
+                continue
+            la = ga[it]
+            lb = gb[it]
+            common_layers = sorted(set(la.keys()) & set(lb.keys()))
+            rows = []
+            for li in common_layers:
+                va = la[li][0] if la[li] else None
+                vb = lb[li][0] if lb[li] else None
+                if va is None or vb is None or va == 0:
+                    continue
+                ratio = vb / va
+                rows.append((li, ratio, va, vb))
+            rows.sort(key=lambda x: abs(math.log(abs(x[1]) + 1e-12)), reverse=True)
+            print("    iter {}: top-{} layers by |log(ratio_b/a)|".format(it, topk))
+            for li, ratio, va, vb in rows[:topk]:
+                print("      layer {:>3}: ratio(b/a)={:.4f}  grad_a={:.4e}  grad_b={:.4e}".format(li, ratio, va, vb))
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--dir', default='tests/alignment_outputs')
-    p.add_argument('--threshold', type=float, default=0.999)
-    p.add_argument('--topk', type=int, default=10)
+    p.add_argument('--dir', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'alignment_outputs'))
+    p.add_argument('--tag-a', default='sp1_noconv', help='reference run tag')
+    p.add_argument('--tag-b', default='sp4_noconv', help='comparison run tag')
+    p.add_argument('--iters', type=int, nargs='*', default=[1, 10],
+                   help='only analyze these iters (default 1 10)')
+    p.add_argument('--cos-threshold', type=float, default=0.999)
+    p.add_argument('--topk', type=int, default=5)
     args = p.parse_args()
 
-    d = args.dir
-    print(f'分析目录: {d}')
-    hs_report = analyze_hidden_states(d, threshold=args.threshold)
-    if not hs_report:
-        print('找不到 hs_* 文件（请确认 alignment_outputs 中存在 hs_sp1_stageX.pt 与 hs_sp4_stageX.pt）')
-        return
-    print('\n=== Hidden-state divergence summary per PP stage ===')
-    for stage, info in sorted(hs_report.items()):
-        print(f'PP Stage {stage}: common iters={info["common_iters"]}  first_bad_iter={info["first_bad"]}')
-        # print cos sim table compact
-        sims = info['cos_sims']
-        for it in sorted(sims.keys()):
-            print(f'  iter {it}: cos={sims[it]:.8f}')
-        # if diverged at iter t, try to analyze layer stats around that stage
-        fb = info['first_bad']
-        if fb is not None and fb >= 2:
-            print(f'  -> Detected divergence at iter {fb}. 尝试加载 layer_stats 做进一步分析...')
-            ls = analyze_layer_stats(d, tag='sp4', stage=stage, topk=args.topk)
-            if ls is None:
-                print('     未找到 layer_stats 文件。')
-            elif 'raw_keys' in ls:
-                print(f'     layer_stats 文件存在，但无法识别内部结构，文件 keys: {ls["raw_keys"]}')
-            else:
-                print('     top layer grad ratio (iter2/iter1):')
-                for lid, ratio, v1, v2 in ls['ratios_topk']:
-                    print(f'       layer {lid}: ratio={ratio:.3f}  grad1={v1:.6e} grad2={v2:.6e}')
-        print('')
+    print("Analysis dir: {}".format(args.dir))
+    print("tag-a (reference) = {}".format(args.tag_a))
+    print("tag-b (compared)  = {}".format(args.tag_b))
+    print("iters of interest = {}".format(args.iters))
 
-    print('\n分析完成。下步建议：对报告中 earliest bad iter 所在的 stage，定位 layer_stats 中 ratio 最大的几层，开启更细粒度的 dump（按 head 或按 time-step）来继续调试。')
+    iters_set = set(args.iters) if args.iters else None
+
+    compare_hidden_states(args.dir, args.tag_a, args.tag_b, iters_set, args.cos_threshold)
+    compare_layer_outs(args.dir, args.tag_a, args.tag_b, iters_set, args.cos_threshold)
+    compare_grad_norms(args.dir, args.tag_a, args.tag_b, iters_set, args.topk)
 
 
 if __name__ == '__main__':

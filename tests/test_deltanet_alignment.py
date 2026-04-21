@@ -39,6 +39,9 @@ _pre_fwd_count = 0
 _current_fwd_meta = {}  # populated by encoder pre-hook: {'cur_train_iter':int, 'micro_idx':int, 'chunk_idx':int}
 layer_forward_stats = {}  # iter -> layer_idx -> list of stats dicts
 layer_grad_stats = {}     # iter -> layer_idx -> list of grad norm floats
+# Full per-layer output tensors (first microbatch only), combined across SP chunks:
+# layer_outs[iter][layer_idx] = list of chunk tensors (len == pipe_sp_splits when complete)
+layer_outs = {}
 
 
 def _get_save_dir():
@@ -163,6 +166,11 @@ def model_provider(pre_process=True, post_process=True):
                         'maxabs': out.float().abs().max().item(),
                     }
                     layer_forward_stats.setdefault(cur_train_iter, {}).setdefault(layer_idx, []).append(stats)
+
+                    # Also store the full activation tensor (first microbatch only)
+                    # so we can compute per-layer cos_sim/max_diff between runs.
+                    # Move to CPU to avoid blowing up GPU memory.
+                    layer_outs.setdefault(cur_train_iter, {}).setdefault(layer_idx, []).append(out.detach().to('cpu'))
 
                     # register a backward hook to capture grad norms for this
                     # output tensor when backward runs
@@ -302,6 +310,13 @@ def _save_hidden_states():
             hs_dict[iter_num] = combined
 
     tag = "nostate" if _DISABLE_STATE_PASSING else f"sp{sp}"
+    # Differentiate no-short-conv runs so their files don't clobber the
+    # short-conv ones.
+    if not getattr(args, 'deltanet_use_short_conv', True):
+        if tag == "nostate":
+            tag = "nostate_noconv"
+        else:
+            tag = f"{tag}_noconv"
     save_path = os.path.join(save_dir, f"hs_{tag}_stage{rank}.pt")
     torch.save(hs_dict, save_path)
     saved_iters = sorted(hs_dict.keys())
@@ -314,6 +329,22 @@ def _save_hidden_states():
         stats_path = os.path.join(save_dir, f"layer_stats_{tag}_stage{rank}.pt")
         torch.save({'forward': layer_forward_stats, 'grad': layer_grad_stats}, stats_path)
         print(f"[Stage {rank}] Saved layer stats to {stats_path}")
+
+    # Save full per-layer output tensors (iter1/iter2 first microbatch),
+    # combining SP chunks into full-seq tensors per layer.
+    if layer_outs:
+        combined_layer_outs = {}  # iter -> layer_idx -> tensor[s_full, b, h]
+        for it, per_layer in layer_outs.items():
+            combined_layer_outs[it] = {}
+            for li, chunks in per_layer.items():
+                if len(chunks) == sp:
+                    try:
+                        combined_layer_outs[it][li] = torch.cat(chunks, dim=0)
+                    except Exception as e:
+                        print(f"[Stage {rank}] Warning: failed to concat layer {li} iter {it}: {e}")
+        outs_path = os.path.join(save_dir, f"layer_outs_{tag}_stage{rank}.pt")
+        torch.save(combined_layer_outs, outs_path)
+        print(f"[Stage {rank}] Saved per-layer outputs to {outs_path}")
 
     # If we have both early and second iter hidden states, print a small diff summary
     try:
