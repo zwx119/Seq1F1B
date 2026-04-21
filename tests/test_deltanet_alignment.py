@@ -237,9 +237,18 @@ if __name__ == "__main__":
     parser.add_argument('--fp32', action='store_true', help='Use fp32 precision')
     # Parse known args to avoid interfering with Megatron's own parser
     args, unknown = parser.parse_known_args()
+    # Ensure megatron's global parser knows about --fp32 too by providing
+    # an extra_args_provider that registers the flag. This avoids
+    # argparse failures when Megatron's parse_args() is called inside
+    # initialize_megatron (which runs in each spawned process).
+    def _extra_args_provider(parser):
+        parser.add_argument('--fp32', action='store_true', help='Use fp32 precision')
+        return parser
+
     # Optionally, you can set a global flag or patch get_args() if needed
     _patched_pretrain(train_valid_test_datasets_provider,
                       model_provider,
                       ModelType.encoder_or_decoder,
                       forward_step,
+                      extra_args_provider=_extra_args_provider,
                       args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
