@@ -156,18 +156,35 @@ def compare_grad_norms(d, tag_a, tag_b, iters_of_interest, topk):
             la = ga[it]
             lb = gb[it]
             common_layers = sorted(set(la.keys()) & set(lb.keys()))
+            # Aggregate grad-norms across SP chunks for a fair comparison:
+            #   full-seq grad norm = sqrt(sum_i ||g_i||^2) for i in SP chunks.
+            # SP=1 lists have length 1; SP=4 lists have length 4.
+            def _agg(vs):
+                vs = [v for v in (vs or []) if v is not None]
+                if not vs:
+                    return None
+                return math.sqrt(sum(v * v for v in vs))
+            n_a = max((len(la[li]) for li in common_layers), default=0)
+            n_b = max((len(lb[li]) for li in common_layers), default=0)
             rows = []
             for li in common_layers:
-                va = la[li][0] if la[li] else None
-                vb = lb[li][0] if lb[li] else None
+                va = _agg(la[li])
+                vb = _agg(lb[li])
                 if va is None or vb is None or va == 0:
                     continue
                 ratio = vb / va
                 rows.append((li, ratio, va, vb))
             rows.sort(key=lambda x: abs(math.log(abs(x[1]) + 1e-12)), reverse=True)
-            print("    iter {}: top-{} layers by |log(ratio_b/a)|".format(it, topk))
+            print("    iter {}: chunks_a={}, chunks_b={}  (aggregated as sqrt(sum_i ||g_i||^2))".format(it, n_a, n_b))
+            print("             top-{} layers by |log(ratio_b/a)|:".format(topk))
             for li, ratio, va, vb in rows[:topk]:
                 print("      layer {:>3}: ratio(b/a)={:.4f}  grad_a={:.4e}  grad_b={:.4e}".format(li, ratio, va, vb))
+            # Also print full sorted list compact form for iter 1 to spot
+            # per-layer anomalies vs the uniform scaling baseline.
+            if it == 1:
+                ratios_sorted = sorted(rows, key=lambda x: x[0])
+                compact = " ".join("L{}:{:.3f}".format(li, r) for li, r, _, _ in ratios_sorted)
+                print("             all layers ratio(b/a): {}".format(compact))
 
 
 def main():
