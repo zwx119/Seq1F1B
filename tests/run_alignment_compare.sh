@@ -10,26 +10,41 @@ DIR=$(cd "$(dirname "$0")/.." && pwd)
 SAVE_DIR="${DIR}/tests/alignment_outputs"
 mkdir -p "${SAVE_DIR}"
 
+# Default to a short debug run (5 iters) unless TRAIN_ITER is explicitly set
+TRAIN_ITER=${TRAIN_ITER:-5}
+
 echo "======================================================"
 echo "  Step 1: Running baseline (PP_SP=1, no sequence split)"
 echo "======================================================"
-PP_SP=1 MASTER_PORT=29500 bash "${DIR}/tests/run_alignment_test.sh"
+PP_SP=1 MASTER_PORT=29500 TRAIN_ITER=${TRAIN_ITER} bash "${DIR}/tests/run_alignment_test.sh" "$@"
 
 echo ""
 echo "======================================================"
 echo "  Step 2: Running Seq1F1B (PP_SP=4, sequence split=4)"
 echo "======================================================"
-PP_SP=4 MASTER_PORT=29501 bash "${DIR}/tests/run_alignment_test.sh"
+PP_SP=4 MASTER_PORT=29501 TRAIN_ITER=${TRAIN_ITER} bash "${DIR}/tests/run_alignment_test.sh" "$@"
 
 echo ""
 echo "======================================================"
 echo "  Step 3: Running ablation (PP_SP=4, NO state passing)"
 echo "======================================================"
-PP_SP=4 DISABLE_STATE_PASSING=1 MASTER_PORT=29502 bash "${DIR}/tests/run_alignment_test.sh"
+PP_SP=4 DISABLE_STATE_PASSING=1 MASTER_PORT=29502 TRAIN_ITER=${TRAIN_ITER} bash "${DIR}/tests/run_alignment_test.sh" "$@"
 
 echo ""
 echo "======================================================"
-echo "  Step 4: Comparing results"
+echo "  Step 4: Running no-conv baseline (PP_SP=1, no short conv)"
+echo "======================================================"
+PP_SP=1 NO_SHORT_CONV=1 MASTER_PORT=29503 TRAIN_ITER=${TRAIN_ITER} bash "${DIR}/tests/run_alignment_test.sh" "$@"
+
+echo ""
+echo "======================================================"
+echo "  Step 5: Running no-conv Seq1F1B (PP_SP=4, no short conv)"
+echo "======================================================"
+PP_SP=4 NO_SHORT_CONV=1 MASTER_PORT=29504 TRAIN_ITER=${TRAIN_ITER} bash "${DIR}/tests/run_alignment_test.sh" "$@"
+
+echo ""
+echo "======================================================"
+echo "  Step 6: Comparing results"
 echo "======================================================"
 echo "--- PP_SP=1 (baseline) last 20 lines ---"
 tail -20 "${SAVE_DIR}/loss_sp1.txt"
@@ -39,6 +54,12 @@ tail -20 "${SAVE_DIR}/loss_sp4.txt"
 echo ""
 echo "--- PP_SP=4 no-state (ablation) last 20 lines ---"
 tail -20 "${SAVE_DIR}/loss_nostate.txt"
+echo ""
+echo "--- PP_SP=1 no-conv (baseline) last 20 lines ---"
+tail -20 "${SAVE_DIR}/loss_sp1_noconv.txt" 2>/dev/null || echo "(not found)"
+echo ""
+echo "--- PP_SP=4 no-conv (Seq1F1B) last 20 lines ---"
+tail -20 "${SAVE_DIR}/loss_sp4_noconv.txt" 2>/dev/null || echo "(not found)"
 echo ""
 
 # Simple Python comparison — save results to file
@@ -121,6 +142,8 @@ def compare_hidden_states(tag_a, tag_b, label, threshold=0.999):
 l1 = parse_losses(os.path.join(SAVE_DIR, 'loss_sp1.txt'))
 l4 = parse_losses(os.path.join(SAVE_DIR, 'loss_sp4.txt'))
 lns = parse_losses(os.path.join(SAVE_DIR, 'loss_nostate.txt'))
+l1nc = parse_losses(os.path.join(SAVE_DIR, 'loss_sp1_noconv.txt'))
+l4nc = parse_losses(os.path.join(SAVE_DIR, 'loss_sp4_noconv.txt'))
 
 print('=' * 60)
 print('=== Loss Comparison ===')
@@ -133,6 +156,9 @@ compare_losses('SP1', l1, 'nostate', lns)
 print()
 print('[C] SP4 (with state) vs SP4-nostate (without state):')
 compare_losses('SP4', l4, 'nostate', lns)
+print()
+print('[D] SP1-noconv vs SP4-noconv (isolate conv state effect):')
+compare_losses('SP1nc', l1nc, 'SP4nc', l4nc)
 
 # ── 2. Hidden states comparisons ──
 print()
@@ -142,10 +168,12 @@ print('=== Hidden States Comparison ===')
 pass_a = compare_hidden_states('sp1', 'sp4', 'SP1 vs SP4 (with state passing)', threshold=0.999)
 pass_b = compare_hidden_states('sp1', 'nostate', 'SP1 vs SP4-nostate (NO state passing)', threshold=0.999)
 pass_c = compare_hidden_states('sp4', 'nostate', 'SP4 vs SP4-nostate', threshold=0.999)
+pass_d = compare_hidden_states('sp1_noconv', 'sp4_noconv', 'SP1-noconv vs SP4-noconv (no conv state effect)', threshold=0.999)
 
 # ── 3. Verdict ──
 print()
 print('=' * 60)
+print('=== Verdict ===')
 if pass_a:
     print('PASSED: SP1 vs SP4 hidden states match → Seq1F1B forward is equivalent.')
 else:
@@ -154,6 +182,12 @@ if not pass_b:
     print('EXPECTED: SP1 vs nostate hidden states differ → state passing IS necessary.')
 else:
     print('UNEXPECTED: SP1 vs nostate match → state passing has no effect?!')
+if pass_d:
+    print('PASSED: SP1-noconv vs SP4-noconv match → conv state detach confirmed as divergence source.')
+else:
+    print('INFO: SP1-noconv vs SP4-noconv also diverge → other factors at play.')
+print()
+print('Key insight: If [D] passes but [A] fails, conv state .detach() is the sole remaining issue.')
 " 2>&1 | tee "${COMPARE_OUTPUT}"
 
 echo ""
