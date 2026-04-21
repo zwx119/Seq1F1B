@@ -40,6 +40,20 @@ _fwd_count = 0     # total forward calls on this stage
 _SAVE_EARLY_ITER = int(os.environ.get("SAVE_EARLY_ITER", "1"))  # save at this iter (1 = before any weight update)
 _SAVE_SECOND_ITER = int(os.environ.get("SAVE_SECOND_ITER", "2"))  # also save at this iter
 _SAVE_LAST_N = int(os.environ.get("SAVE_LAST_N", "3"))           # save last N iters
+# Extra iters to capture (comma-separated list in env var, e.g. "10,50,100,500").
+# Merged with {_SAVE_EARLY_ITER, _SAVE_SECOND_ITER} and the last-N iters.
+_SAVE_EXTRA_ITERS = set()
+_extra_env = os.environ.get("SAVE_EXTRA_ITERS", "").strip()
+if _extra_env:
+    for _tok in _extra_env.split(","):
+        _tok = _tok.strip()
+        if _tok:
+            try:
+                _SAVE_EXTRA_ITERS.add(int(_tok))
+            except ValueError:
+                pass
+# Convenience: a superset of iters at which we want to capture layer_outs/grad.
+_SAVE_ITER_SET = {_SAVE_EARLY_ITER, _SAVE_SECOND_ITER} | _SAVE_EXTRA_ITERS
 # For layer-level stats dumping
 _pre_fwd_count = 0
 _current_fwd_meta = {}  # populated by encoder pre-hook: {'cur_train_iter':int, 'micro_idx':int, 'chunk_idx':int}
@@ -111,7 +125,7 @@ def model_provider(pre_process=True, post_process=True):
 
         # At the end of first microbatch, prune old iters
         if chunk_idx == sp - 1:
-            keep_iters = {_SAVE_EARLY_ITER, _SAVE_SECOND_ITER}
+            keep_iters = set(_SAVE_ITER_SET)
             for j in range(max(1, cur_train_iter - _SAVE_LAST_N + 1), cur_train_iter + 1):
                 keep_iters.add(j)
             for k in list(_hs_chunks.keys()):
@@ -160,8 +174,8 @@ def model_provider(pre_process=True, post_process=True):
                     # Only capture the first microbatch of each iter
                     if micro_idx != 0:
                         return
-                    # Only capture the two iters we care about
-                    if cur_train_iter not in (_SAVE_EARLY_ITER, _SAVE_SECOND_ITER):
+                    # Only capture the iters we care about
+                    if cur_train_iter not in _SAVE_ITER_SET:
                         return
 
                     # compute stats

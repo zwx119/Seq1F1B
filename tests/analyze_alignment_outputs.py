@@ -187,6 +187,38 @@ def compare_grad_norms(d, tag_a, tag_b, iters_of_interest, topk):
                 print("             all layers ratio(b/a): {}".format(compact))
 
 
+def drift_summary(d, tag_a, tag_b, iters_of_interest):
+    """Print a compact iter -> cos_sim table for encoder output, so we can
+    eyeball how fast the two runs drift apart over training steps."""
+    print('\n' + '=' * 70)
+    print("=== Drift summary (encoder output cos_sim vs iter): {}  vs  {}".format(tag_a, tag_b))
+    print('=' * 70)
+    stages_a = find_stage_files(d, 'hs_{}_stage{{rank}}.pt'.format(tag_a))
+    stages_b = find_stage_files(d, 'hs_{}_stage{{rank}}.pt'.format(tag_b))
+    stages = sorted(set(stages_a) & set(stages_b))
+    if not stages:
+        print("  (No hs files)")
+        return
+    for s in stages:
+        ha = torch.load(stages_a[s], map_location='cpu')
+        hb = torch.load(stages_b[s], map_location='cpu')
+        common = sorted(set(ha.keys()) & set(hb.keys()))
+        if iters_of_interest:
+            common = [it for it in common if it in iters_of_interest]
+        if not common:
+            continue
+        print("\n  PP Stage {}:".format(s))
+        print("    {:>6}  {:>12}  {:>12}  {:>12}".format('iter', 'cos_sim', 'max_diff', 'mean_diff'))
+        for it in common:
+            a, b = ha[it], hb[it]
+            if a.shape != b.shape:
+                continue
+            cs = cos_sim(a, b)
+            md = max_abs_diff(a, b)
+            mn = mean_abs_diff(a, b)
+            print("    {:>6}  {:>12.8f}  {:>12.3e}  {:>12.3e}".format(it, cs, md, mn))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--dir', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'alignment_outputs'))
@@ -208,6 +240,7 @@ def main():
     compare_hidden_states(args.dir, args.tag_a, args.tag_b, iters_set, args.cos_threshold)
     compare_layer_outs(args.dir, args.tag_a, args.tag_b, iters_set, args.cos_threshold)
     compare_grad_norms(args.dir, args.tag_a, args.tag_b, iters_set, args.topk)
+    drift_summary(args.dir, args.tag_a, args.tag_b, iters_set)
 
 
 if __name__ == '__main__':
