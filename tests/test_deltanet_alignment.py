@@ -246,9 +246,18 @@ if __name__ == "__main__":
         return parser
 
     # Optionally, you can set a global flag or patch get_args() if needed
+    # If the user requested --fp32, pass defaults to Megatron to disable
+    # mixed precision and force fp32 parameters/computations.
+    args_defaults = {'tokenizer_type': 'GPT2BPETokenizer'}
+    if args.fp32:
+        # Ensure spawned processes also run in fp32 by setting defaults
+        # for fp16/bf16 to False. Megatron's argument parsing will respect
+        # these defaults when flags are not explicitly set.
+        args_defaults.update({'fp16': False, 'bf16': False})
+
     _patched_pretrain(train_valid_test_datasets_provider,
                       model_provider,
                       ModelType.encoder_or_decoder,
                       forward_step,
                       extra_args_provider=_extra_args_provider,
-                      args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+                      args_defaults=args_defaults)
