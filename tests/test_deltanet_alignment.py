@@ -17,6 +17,7 @@ import sys
 import torch
 import torch.distributed as dist
 from collections import deque
+import argparse
 
 from megatron import get_args, print_rank_0
 from megatron.core import parallel_state, tensor_parallel
@@ -232,6 +233,11 @@ def _patched_pretrain(*args, **kwargs):
     _save_hidden_states()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--fp32', action='store_true', help='Use fp32 precision')
+    # Parse known args to avoid interfering with Megatron's own parser
+    args, unknown = parser.parse_known_args()
+    # Optionally, you can set a global flag or patch get_args() if needed
     _patched_pretrain(train_valid_test_datasets_provider,
                       model_provider,
                       ModelType.encoder_or_decoder,
