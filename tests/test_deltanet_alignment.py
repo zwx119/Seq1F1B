@@ -223,6 +223,32 @@ def get_batch(data_iterator):
         data = None
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
     tokens_ = data_b['text'].long()
+
+    # ── Data-determinism sanity print ──────────────────────────────────
+    # Hash the FULL (unchunked) tokens tensor so SP=1 and SP=4 should
+    # print byte-identical hashes at the same global iter. Any discrepancy
+    # means the two runs are not seeing the same data and the cos_sim
+    # comparison downstream is meaningless.
+    # Gate: only rank 0, only the first few iters (avoid log spam), and
+    # only once per iter (the get_batch-SP factory calls get_batch once
+    # every pipe_sp_splits micro-chunks, so we hash there).
+    try:
+        import hashlib
+        from megatron.core import parallel_state as _ps
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _pp_first = _ps.is_pipeline_first_stage() if torch.distributed.is_initialized() else True
+        _iter = getattr(args, 'curr_iteration', None)
+        if _iter is None:
+            # fallback: count calls
+            _iter = _get_batch_hash_call_counter()
+        if _rank == 0 and _pp_first and _iter in _DATA_HASH_ITERS:
+            _h = hashlib.md5(tokens_.detach().cpu().numpy().tobytes()).hexdigest()
+            print(f"[DATA-HASH] iter={_iter}  "
+                  f"shape={tuple(tokens_.shape)}  "
+                  f"dtype={tokens_.dtype}  md5={_h}", flush=True)
+    except Exception as _e:
+        pass
+
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
     from megatron import get_tokenizer
@@ -231,6 +257,24 @@ def get_batch(data_iterator):
         tokens, tokenizer.eod,
         args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss)
     return tokens, labels, loss_mask, attention_mask, position_ids
+
+
+# Iters at which to print the data hash (small set — just for sanity).
+_DATA_HASH_ITERS = {1, 2, 3, 10, 100}
+_extra_data_hash = os.environ.get("DATA_HASH_ITERS", "").strip()
+if _extra_data_hash:
+    for _tok in _extra_data_hash.split(","):
+        _tok = _tok.strip()
+        if _tok:
+            try:
+                _DATA_HASH_ITERS.add(int(_tok))
+            except ValueError:
+                pass
+
+_data_hash_counter = [0]
+def _get_batch_hash_call_counter():
+    _data_hash_counter[0] += 1
+    return _data_hash_counter[0]
 
 
 def get_batch_sp_func_factory():
