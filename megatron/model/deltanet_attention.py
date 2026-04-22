@@ -60,6 +60,133 @@ except ImportError:
 
 
 # ============================================================================
+# ShortConvChunkFunc: depthwise causal conv1d with Seq1F1B cross-chunk
+# gradient relay (same pattern as DeltaNetChunkFunc).
+#
+# Short convolution cache semantics (from fla.modules.conv.short_conv):
+#   - `cache` fed into ShortConvolution.forward is the last (W-1) input
+#     tokens of the previous chunk, used as prefix so that the first (W-1)
+#     positions of the current chunk have valid causal history.
+#   - Plain `.detach()` on the cache (the pre-existing implementation) breaks
+#     the gradient path, losing (W-1) positions worth of gradient per chunk
+#     boundary, per layer.
+#
+# This Function manages the cache via explicit dicts (conv_cache / conv_grad)
+# instead of tensor-arg autograd edges, mirroring DeltaNetChunkFunc and
+# FlashAttnVarlenFunc's kv_cache design so the Seq1F1B scheduler's
+# chunk-by-chunk backward never tries to traverse back through a previous
+# chunk's autograd graph.
+#
+# Forward  (chunk N):  prefix := conv_cache[name]         (detached)
+#                      y      := F.conv1d([prefix;x], W) + activation
+#                      conv_cache[name] := x[-W+1:]        (detached)
+# Backward (chunk N):  d_from_next := conv_grad[name]      (written by N+1)
+#                      dx[-W+1:] += d_from_next
+#                      dx, dw, db, d_prefix := conv1d_bwd
+#                      conv_grad[name] := d_prefix          (read by N-1)
+# ============================================================================
+
+class ShortConvChunkFunc(torch.autograd.Function):
+    """Depthwise causal 1-D convolution with Seq1F1B cross-chunk gradient relay.
+
+    Parameters
+    ----------
+    x      : [B, T, D] chunk input
+    weight : [D, 1, W] depthwise conv weight (from fla.ShortConvolution.weight)
+    bias   : [D] or None
+    cache_dict, grad_dict : per-layer shared dicts, keyed by `name` ('q','k','v')
+    name       : unique key within the layer
+    activation : 'silu' | 'swish' | None
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, cache_dict, grad_dict, name, activation):
+        B, T, D = x.shape
+        W = weight.shape[-1]
+
+        prefix = cache_dict.get(name, None)  # [B, W-1, D] detached, or None
+        had_prefix = prefix is not None
+        if not had_prefix:
+            prefix = x.new_zeros(B, W - 1, D)
+
+        # [B, W-1+T, D] → depthwise conv1d → [B, T, D]
+        x_full = torch.cat([prefix, x], dim=1)
+        x_full_bdt = x_full.transpose(1, 2).contiguous()
+        y_pre_bdt = F.conv1d(x_full_bdt, weight, bias=bias, groups=D)
+        y_pre = y_pre_bdt.transpose(1, 2).contiguous()
+
+        if activation in ('silu', 'swish'):
+            y = F.silu(y_pre)
+        elif activation is None:
+            y = y_pre
+        else:
+            raise ValueError(f"ShortConvChunkFunc: unsupported activation `{activation}`")
+
+        # Write this chunk's tail to the cache for the next chunk.
+        # Detach+clone to guarantee no autograd edge leaks across chunks.
+        if T >= W - 1:
+            new_cache = x[:, -(W - 1):, :].detach().clone()
+        else:
+            # Short chunk: blend previous prefix with whole x
+            new_cache = torch.cat([prefix[:, T:, :], x], dim=1).detach().clone()
+        cache_dict[name] = new_cache
+
+        ctx.save_for_backward(x, weight, prefix, y_pre)
+        ctx.activation = activation
+        ctx.has_bias = bias is not None
+        ctx.grad_dict = grad_dict
+        ctx.name = name
+        ctx.had_prefix = had_prefix
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, weight, prefix, y_pre = ctx.saved_tensors
+        B, T, D = x.shape
+        W = weight.shape[-1]
+
+        # Activation backward (silu derivative = sigmoid(x) + x*sig*(1-sig))
+        if ctx.activation in ('silu', 'swish'):
+            s = torch.sigmoid(y_pre)
+            dy = dy * (s + y_pre * s * (1.0 - s))
+
+        # Conv1d backward on the full [prefix;x] input
+        x_full = torch.cat([prefix, x], dim=1)
+        x_full_bdt = x_full.transpose(1, 2).contiguous()
+        dy_bdt = dy.transpose(1, 2).contiguous()
+
+        dx_full_bdt = torch.nn.grad.conv1d_input(
+            input_size=x_full_bdt.shape, weight=weight,
+            grad_output=dy_bdt, groups=D,
+        )
+        dw = torch.nn.grad.conv1d_weight(
+            input=x_full_bdt, weight_size=weight.shape,
+            grad_output=dy_bdt, groups=D,
+        )
+        db = dy_bdt.sum(dim=(0, 2)) if ctx.has_bias else None
+
+        dx_full = dx_full_bdt.transpose(1, 2).contiguous()
+        dx_prefix = dx_full[:, :W - 1, :].contiguous()   # grad wrt previous chunk's tail
+        dx = dx_full[:, W - 1:, :].contiguous()          # grad wrt this chunk's x
+
+        # Absorb gradient flowing back from the next chunk (written by its
+        # backward into grad_dict[name] as its own dx_prefix).
+        d_from_next = ctx.grad_dict.pop(ctx.name, None)
+        if d_from_next is not None:
+            # d_from_next shape [B, W-1, D] — add to this chunk's tail grad.
+            dx[:, -(W - 1):, :] = dx[:, -(W - 1):, :] + d_from_next
+
+        # Publish dx_prefix for the previous chunk's backward. Chunk 0 has no
+        # previous chunk; we still write but _clear_states() clears it before
+        # the next microbatch starts.
+        if ctx.had_prefix:
+            ctx.grad_dict[ctx.name] = dx_prefix
+
+        # grads for (x, weight, bias, cache_dict, grad_dict, name, activation)
+        return dx, dw, db, None, None, None, None
+
+
+# ============================================================================
 # DeltaNetChunkFunc: custom autograd Function with backward state gradient relay
 # Analogous to FlashAttnVarlenFunc for softmax attention in Seq1F1B.
 #
@@ -315,19 +442,26 @@ class DeltaNetAttention(MegatronModule):
         )
 
         # === Seq1F1B state management ===
-        # recurrent_state and d_state are stored in state_cache dict
-        # (not as tensor attributes) to avoid autograd edges between chunks
+        # DeltaNet recurrent state + d_state are relayed via self.state_cache.
+        # Short-conv prefix tokens + their gradients are relayed via two
+        # per-layer dicts managed by ShortConvChunkFunc (keyed by 'q'/'k'/'v').
+        self.state_cache = {}
+        self.conv_cache_dict = {}   # fwd: previous chunk's tail input tokens
+        self.conv_grad_dict = {}    # bwd: gradient wrt the previous chunk's tail
+        # Legacy placeholders (kept so external state_dict code does not break,
+        # but are no longer read/written by the forward path).
         self.conv_state_q = None
         self.conv_state_k = None
         self.conv_state_v = None
-        self.state_cache = {}
 
     def _clear_states(self):
         """Clear all cached states. Called when micro_sp_idx == 0."""
+        self.state_cache = {}
+        self.conv_cache_dict = {}
+        self.conv_grad_dict = {}
         self.conv_state_q = None
         self.conv_state_k = None
         self.conv_state_v = None
-        self.state_cache = {}
 
     def _stateful_middle(self, q, k, v, hidden_states_bsh,
                           use_conv_cache, output_final_state):
@@ -353,25 +487,29 @@ class DeltaNetAttention(MegatronModule):
 
         # ============ Short Convolutions ============
         if self.use_short_conv:
-            q, conv_state_q = self.q_conv1d(
-                x=q,
-                cache=self.conv_state_q if use_conv_cache else None,
-                output_final_state=output_final_state,
-            )
-            k, conv_state_k = self.k_conv1d(
-                x=k,
-                cache=self.conv_state_k if use_conv_cache else None,
-                output_final_state=output_final_state,
-            )
-            v, conv_state_v = self.v_conv1d(
-                x=v,
-                cache=self.conv_state_v if use_conv_cache else None,
-                output_final_state=output_final_state,
-            )
-            # Detach conv states to prevent backward through previous span's graph
-            self.conv_state_q = conv_state_q.detach() if conv_state_q is not None else None
-            self.conv_state_k = conv_state_k.detach() if conv_state_k is not None else None
-            self.conv_state_v = conv_state_v.detach() if conv_state_v is not None else None
+            # Activation name per conv (q/k driven by qk_activation, v always silu)
+            qk_act = 'silu' if self.qk_activation == 'silu' else None
+            if output_final_state:
+                # Chunked / stateful Seq1F1B path: use ShortConvChunkFunc so
+                # gradient correctly relays across chunk boundaries (no detach).
+                q = ShortConvChunkFunc.apply(
+                    q, self.q_conv1d.weight, self.q_conv1d.bias,
+                    self.conv_cache_dict, self.conv_grad_dict, 'q', qk_act,
+                )
+                k = ShortConvChunkFunc.apply(
+                    k, self.k_conv1d.weight, self.k_conv1d.bias,
+                    self.conv_cache_dict, self.conv_grad_dict, 'k', qk_act,
+                )
+                v = ShortConvChunkFunc.apply(
+                    v, self.v_conv1d.weight, self.v_conv1d.bias,
+                    self.conv_cache_dict, self.conv_grad_dict, 'v', 'silu',
+                )
+            else:
+                # Non-chunked (SP=1 + no force-seq-chunks) — use fla's fused
+                # kernel for speed; there is no cross-chunk gradient to relay.
+                q, _ = self.q_conv1d(x=q, cache=None, output_final_state=False)
+                k, _ = self.k_conv1d(x=k, cache=None, output_final_state=False)
+                v, _ = self.v_conv1d(x=v, cache=None, output_final_state=False)
         else:
             # Without short conv, apply activation directly
             if self.qk_activation == 'silu':
