@@ -381,6 +381,10 @@ def _save_hidden_states():
             tag = "nostate_noconv"
         else:
             tag = f"{tag}_noconv"
+    # lr=0 weight-freeze experiment: tag differently so captures don't
+    # clobber the normal (lr>0) runs. Detect via args.lr==0.
+    if float(getattr(args, 'lr', 0.0) or 0.0) == 0.0:
+        tag = f"{tag}_lr0"
     # Allow caller to further disambiguate runs with the same (sp, noconv)
     # configuration (e.g. two SP=1 runs with different
     # CUDA_DEVICE_MAX_CONNECTIONS, for the sp1-vs-sp1 sanity check).
