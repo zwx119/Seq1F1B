@@ -12,7 +12,15 @@ set -euo pipefail
 # perturb floating-point accumulation order without changing the algorithm).
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
-GPUS=${GPUS_PER_NODE:-8}
+# Auto-detect GPU count if not specified. On 4-GPU machines this becomes
+# PP=4 automatically (NUM_LAYERS=24 is divisible by both 4 and 8).
+if [ -z "${GPUS_PER_NODE:-}" ]; then
+    if command -v nvidia-smi > /dev/null 2>&1; then
+        GPUS_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l)
+    fi
+    GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+fi
+GPUS=${GPUS_PER_NODE}
 PP_SP=${PP_SP:-1}
 PP_SP_STR=${PP_SP_STR:-average}
 SEQ_LEN=${SEQ_LEN:-8192}
