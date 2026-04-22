@@ -14,12 +14,15 @@ DIR=$(cd "$(dirname "$0")/.." && pwd)
 SAVE_DIR="${DIR}/tests/alignment_outputs"
 mkdir -p "${SAVE_DIR}"
 
-# Default to a longer run so we can see cumulative drift
-TRAIN_ITER=${TRAIN_ITER:-500}
+# Default to a short run: iter 10 already shows the divergence clearly.
+TRAIN_ITER=${TRAIN_ITER:-10}
 # Iters at which we dump full hidden states + per-layer outputs + grad norms.
 # iter 1 and iter 2 are always included by the python side.
-SAVE_EXTRA_ITERS=${SAVE_EXTRA_ITERS:-"10,50,100,200,500"}
+SAVE_EXTRA_ITERS=${SAVE_EXTRA_ITERS:-"5,10"}
 export SAVE_EXTRA_ITERS
+
+# Default to 8 GPUs if available. Override via env: GPUS_PER_NODE=2 bash ...
+export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
 # 把用户传入的额外参数（例如 --fp32）转发到内层脚本；并默认加 --dump-layer-stats
 EXTRA_ARGS=("$@")
