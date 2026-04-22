@@ -337,6 +337,12 @@ def _save_hidden_states():
             tag = "nostate_noconv"
         else:
             tag = f"{tag}_noconv"
+    # Allow caller to further disambiguate runs with the same (sp, noconv)
+    # configuration (e.g. two SP=1 runs with different
+    # CUDA_DEVICE_MAX_CONNECTIONS, for the sp1-vs-sp1 sanity check).
+    _tag_suffix = os.environ.get("TAG_SUFFIX", "").strip()
+    if _tag_suffix:
+        tag = f"{tag}_{_tag_suffix}"
     save_path = os.path.join(save_dir, f"hs_{tag}_stage{rank}.pt")
     torch.save(hs_dict, save_path)
     saved_iters = sorted(hs_dict.keys())

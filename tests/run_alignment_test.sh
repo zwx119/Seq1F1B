@@ -7,7 +7,10 @@
 #   PP_SP=4 bash tests/run_alignment_test.sh   # Seq1F1B
 set -euo pipefail
 
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+# Default to the deterministic single-connection setting, but let callers
+# override it (e.g. the sp1-vs-sp1 sanity check uses =8 on the "alt" run to
+# perturb floating-point accumulation order without changing the algorithm).
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 GPUS=${GPUS_PER_NODE:-8}
 PP_SP=${PP_SP:-1}
@@ -105,6 +108,10 @@ elif [ "${NO_SHORT_CONV}" = "1" ]; then
     TAG="sp${PP_SP}_noconv"
 else
     TAG="sp${PP_SP}"
+fi
+# Keep log/loss filename in sync with the python-side TAG_SUFFIX if set.
+if [ -n "${TAG_SUFFIX:-}" ]; then
+    TAG="${TAG}_${TAG_SUFFIX}"
 fi
 
 OUTPUT_FILE="${SAVE_DIR}/loss_${TAG}.txt"
