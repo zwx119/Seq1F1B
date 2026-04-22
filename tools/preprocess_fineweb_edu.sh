@@ -66,8 +66,7 @@ else
         --merge-file "${MERGE}" \
         --tokenizer-type GPT2BPETokenizer \
         --append-eod \
-        --workers "${WORKERS}" \
-        --chunk-size 1000
+        --workers "${WORKERS}"
 fi
 
 BIN_SIZE=$(du -h "${OUT_PREFIX}_text_document.bin" 2>/dev/null | awk '{print $1}')
