@@ -19,6 +19,8 @@ NUM_HEADS=${NUM_HEADS:-16}
 MICRO_BATCH=${MICRO_BATCH:-1}
 GLOBAL_BATCH=${GLOBAL_BATCH:-4}
 TRAIN_ITER=${TRAIN_ITER:-500}
+LR=${LR:-6.0e-4}
+MIN_LR=${MIN_LR:-6.0e-5}
 
 DATA_PATH=${DATA_PATH:-""}
 
@@ -45,8 +47,8 @@ options=" \
     --max-position-embeddings ${SEQ_LEN} \
     --micro-batch-size ${MICRO_BATCH} \
     --global-batch-size ${GLOBAL_BATCH} \
-    --lr 6.0e-4 \
-    --min-lr 6.0e-5 \
+    --lr ${LR} \
+    --min-lr ${MIN_LR} \
     --lr-decay-style cosine \
     --train-iters ${TRAIN_ITER} \
     --log-interval 1 \
