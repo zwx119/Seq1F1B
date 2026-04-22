@@ -25,6 +25,22 @@ TRAIN_ITER=${TRAIN_ITER:-500}
 LR=${LR:-6.0e-4}
 MIN_LR=${MIN_LR:-6.0e-5}
 
+# LR0=1 ⇒ set lr=0, min_lr=0, weight_decay=0, constant schedule.
+# Effect: forward + backward run normally (so all cos_sim / grad hooks
+# still work), but optimizer.step() becomes a no-op, so weights stay at
+# W0 for the entire run. This isolates per-iteration kernel noise from
+# the multi-iter chaotic amplification of weight drift.
+LR0=${LR0:-0}
+if [ "${LR0}" = "1" ]; then
+    LR=0.0
+    MIN_LR=0.0
+    LR_DECAY_STYLE=constant
+    WEIGHT_DECAY=0.0
+else
+    LR_DECAY_STYLE=${LR_DECAY_STYLE:-cosine}
+    WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}
+fi
+
 DATA_PATH=${DATA_PATH:-""}
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)
@@ -52,7 +68,7 @@ options=" \
     --global-batch-size ${GLOBAL_BATCH} \
     --lr ${LR} \
     --min-lr ${MIN_LR} \
-    --lr-decay-style cosine \
+    --lr-decay-style ${LR_DECAY_STYLE} \
     --train-iters ${TRAIN_ITER} \
     --log-interval 1 \
     --eval-iters 0 \
@@ -71,7 +87,7 @@ options=" \
     --no-save-optim \
     --no-save-rng \
     --clip-grad 1.0 \
-    --weight-decay 0.1 \
+    --weight-decay ${WEIGHT_DECAY} \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --init-method-std 0.006 \
@@ -108,6 +124,9 @@ elif [ "${NO_SHORT_CONV}" = "1" ]; then
     TAG="sp${PP_SP}_noconv"
 else
     TAG="sp${PP_SP}"
+fi
+if [ "${LR0}" = "1" ]; then
+    TAG="${TAG}_lr0"
 fi
 # Keep log/loss filename in sync with the python-side TAG_SUFFIX if set.
 if [ -n "${TAG_SUFFIX:-}" ]; then
