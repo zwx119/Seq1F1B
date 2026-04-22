@@ -69,9 +69,13 @@ fi
 # -------- 2. install deps if missing --------
 if ! command -v huggingface-cli >/dev/null 2>&1; then
     echo "Installing huggingface_hub + hf_transfer..."
-    pip install -q -U "huggingface_hub[cli]" hf_transfer
+    # IMPORTANT: pin huggingface-hub<1.0 to avoid breaking `transformers` (fla dep).
+    # Using --no-deps on hf_transfer to keep other packages untouched.
+    pip install -q "huggingface_hub[cli]>=0.34.0,<1.0"
+    pip install -q --no-deps hf_transfer || true
 fi
-# hf_transfer: multi-connection downloader, 3-5x faster on fat pipes
+# hf_transfer: multi-connection downloader, 3-5x faster on fat pipes.
+# If hf_transfer import fails at runtime, HF cli will fall back gracefully.
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 # -------- 3. download with resume (idempotent) --------
