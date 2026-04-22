@@ -60,7 +60,6 @@ options=" \
     --deltanet-qk-activation silu \
     --deltanet-qk-norm l2 \
     --deltanet-use-beta \
-    --bf16 \
     --untie-embeddings-and-output-weights \
     --hidden-dropout 0 \
     --attention-dropout 0 \
@@ -115,6 +114,20 @@ OUTPUT_FILE="${SAVE_DIR}/loss_${TAG}.txt"
 # script. Without this, flags injected by the outer script never reach
 # test_deltanet_alignment.py.
 EXTRA_PY_ARGS="$*"
+
+# Precision: default bf16, but if caller passes --fp32 we must NOT also
+# append --bf16 (they are mutually exclusive and --bf16 wins at arg-parse
+# time, silently turning an "fp32" run back into bf16).
+USE_FP32=0
+for a in "$@"; do
+    if [ "$a" = "--fp32" ]; then
+        USE_FP32=1
+        break
+    fi
+done
+if [ "${USE_FP32}" = "0" ]; then
+    options="${options} --bf16"
+fi
 
 run_cmd="DISABLE_STATE_PASSING=${DISABLE_STATE_PASSING} torchrun ${DISTRIBUTED_ARGS} ${DIR}/tests/test_deltanet_alignment.py ${options} ${EXTRA_PY_ARGS}"
 echo "====== Alignment Test (PP_SP=${PP_SP}, TAG=${TAG}) ======"
