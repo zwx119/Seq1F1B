@@ -329,6 +329,137 @@ class DeltaNetAttention(MegatronModule):
         self.conv_state_v = None
         self.state_cache = {}
 
+    def _stateful_middle(self, q, k, v, hidden_states_bsh,
+                          use_conv_cache, output_final_state):
+        """Stateful middle section: short conv -> reshape -> beta -> delta rule.
+
+        Runs on a single (possibly chunked) slice of the sequence. All the
+        state passing (conv caches, recurrent_state) happens through
+        self.conv_state_{q,k,v} and self.state_cache, which are read when
+        use_conv_cache / initial_state is active and written when
+        output_final_state is True.
+
+        Inputs:
+          q, k, v:             [b, s, key/value_dim_per_partition] (post-projection, post-transpose)
+          hidden_states_bsh:   [b, s, h]                            (for b_proj)
+          use_conv_cache:      bool — read self.conv_state_{q,k,v} as initial conv state
+          output_final_state:  bool — update self.conv_state_{q,k,v} and self.state_cache
+
+        Output:
+          o: [b, s, num_heads_per_partition, head_dim]
+        """
+        args = get_args()
+        batch_size, seq_len, _ = hidden_states_bsh.shape
+
+        # ============ Short Convolutions ============
+        if self.use_short_conv:
+            q, conv_state_q = self.q_conv1d(
+                x=q,
+                cache=self.conv_state_q if use_conv_cache else None,
+                output_final_state=output_final_state,
+            )
+            k, conv_state_k = self.k_conv1d(
+                x=k,
+                cache=self.conv_state_k if use_conv_cache else None,
+                output_final_state=output_final_state,
+            )
+            v, conv_state_v = self.v_conv1d(
+                x=v,
+                cache=self.conv_state_v if use_conv_cache else None,
+                output_final_state=output_final_state,
+            )
+            # Detach conv states to prevent backward through previous span's graph
+            self.conv_state_q = conv_state_q.detach() if conv_state_q is not None else None
+            self.conv_state_k = conv_state_k.detach() if conv_state_k is not None else None
+            self.conv_state_v = conv_state_v.detach() if conv_state_v is not None else None
+        else:
+            # Without short conv, apply activation directly
+            if self.qk_activation == 'silu':
+                q, k = F.silu(q), F.silu(k)
+            v = F.silu(v)
+
+        # ============ Reshape to multi-head ============
+        q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
+        k = rearrange(k, 'b s (h d) -> b s h d', d=self.head_dim)
+        v = rearrange(v, 'b s (h d) -> b s h d', d=self.head_dim)
+
+        # ============ QK activation (if not handled by conv) ============
+        if self.use_short_conv and self.qk_activation != 'silu':
+            if self.qk_activation == 'relu':
+                q, k = q.relu(), k.relu()
+            elif self.qk_activation == 'elu':
+                q = (F.elu(q, 1., False) + 1.).to(q)
+                k = (F.elu(k, 1., False) + 1.).to(k)
+
+        # ============ Beta ============
+        if self.use_beta:
+            beta = self.b_proj(hidden_states_bsh).sigmoid()
+        else:
+            beta = torch.ones(
+                batch_size, seq_len, self.num_attention_heads_per_partition,
+                device=hidden_states_bsh.device, dtype=hidden_states_bsh.dtype
+            )
+
+        # ============ DeltaNet core computation ============
+        mode = 'fused_recurrent' if seq_len <= 64 else self.deltanet_mode
+        initial_state = self.state_cache.get('recurrent_state', None)
+
+        if output_final_state and mode == 'chunk':
+            # Seq1F1B path: use DeltaNetChunkFunc with backward state gradient relay.
+            orig_dtype = q.dtype
+            needs_cast = (orig_dtype == torch.float32)
+            if needs_cast:
+                q_kv_dtype = torch.bfloat16
+                q = q.to(q_kv_dtype)
+                k = k.to(q_kv_dtype)
+                v = v.to(q_kv_dtype)
+                beta = beta.to(q_kv_dtype)
+
+            o = DeltaNetChunkFunc.apply(
+                q, k, v, beta,
+                self.head_dim ** -0.5,
+                self.state_cache,
+                (self.qk_norm == 'l2'),
+            )
+            if needs_cast:
+                o = o.to(orig_dtype)
+        elif mode == 'fused_recurrent':
+            o, recurrent_state = fused_recurrent_delta_rule(
+                q=q, k=k, v=v, beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
+            )
+            if output_final_state and recurrent_state is not None:
+                self.state_cache['recurrent_state'] = recurrent_state.detach()
+        elif mode == 'chunk':
+            orig_dtype = q.dtype
+            needs_cast = (orig_dtype == torch.float32)
+            if needs_cast:
+                q_kv_dtype = torch.bfloat16
+                q = q.to(q_kv_dtype)
+                k = k.to(q_kv_dtype)
+                v = v.to(q_kv_dtype)
+                beta = beta.to(q_kv_dtype)
+
+            o, recurrent_state = chunk_delta_rule(
+                q=q, k=k, v=v, beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
+            )
+            if needs_cast:
+                o = o.to(orig_dtype)
+                if recurrent_state is not None:
+                    try:
+                        recurrent_state = recurrent_state.to(orig_dtype)
+                    except Exception:
+                        pass
+        else:
+            raise NotImplementedError(f"DeltaNet mode `{mode}` not supported.")
+
+        return o
+
     def forward(
         self,
         hidden_states,      # [s, b, h] (Megatron convention)
@@ -389,139 +520,53 @@ class DeltaNetAttention(MegatronModule):
             hidden_states_bsh = hidden_states.transpose(0, 1).contiguous()
         batch_size, seq_len, _ = hidden_states_bsh.shape
 
-        # ============ Short Convolutions ============
-        if self.use_short_conv:
-            # Determine if we need to use conv state (Seq1F1B continuation)
+        # ============ Optional force-seq-chunks mode (for verification) ============
+        # When --force-seq-chunks N > 1 and pipe_sp_splits == 1, internally run
+        # the stateful middle N times with state passing — replicating exactly
+        # the DeltaNet kernel-call sequence that pipe_sp_splits=N would use,
+        # while keeping everything else (projections, norms, FFN, PP schedule)
+        # on the full sequence. This isolates the chunked DeltaNet computation
+        # from all other system-level sources of fp noise, so that a bit-level
+        # (fp32) diff between SP=1 and SP=1+force-seq-chunks=N proves Seq1F1B's
+        # DeltaNet integration is algorithmically correct.
+        fsc = getattr(args, 'force_seq_chunks', 1)
+        use_force_chunks = (args.pipe_sp_splits == 1 and fsc > 1
+                            and micro_sp_idx is None)
+        if use_force_chunks:
+            assert seq_len % fsc == 0, (
+                f"seq_len {seq_len} must be divisible by "
+                f"--force-seq-chunks {fsc}")
+            # This forward owns the full sequence; always start fresh and
+            # rebuild state via the in-loop chain.
+            self._clear_states()
+            chunk = seq_len // fsc
+            outs = []
+            for i in range(fsc):
+                sl = slice(i * chunk, (i + 1) * chunk)
+                o_i = self._stateful_middle(
+                    q[:, sl].contiguous(),
+                    k[:, sl].contiguous(),
+                    v[:, sl].contiguous(),
+                    hidden_states_bsh[:, sl].contiguous(),
+                    use_conv_cache=(i > 0),
+                    output_final_state=True,
+                )
+                outs.append(o_i)
+            # Clear transient cross-chunk state so that subsequent forward
+            # calls in the same training iteration (e.g. microbatch 2, 3, …)
+            # start fresh — matching the SP=1 baseline behaviour.
+            self._clear_states()
+            o = torch.cat(outs, dim=1)
+        else:
+            # Original single-call path.
             use_conv_cache = (args.pipe_sp_splits > 1 and micro_sp_idx is not None
                               and micro_sp_idx > 0)
-
-            q, conv_state_q = self.q_conv1d(
-                x=q,
-                cache=self.conv_state_q if use_conv_cache else None,
-                output_final_state=(args.pipe_sp_splits > 1),
-            )
-            k, conv_state_k = self.k_conv1d(
-                x=k,
-                cache=self.conv_state_k if use_conv_cache else None,
-                output_final_state=(args.pipe_sp_splits > 1),
-            )
-            v, conv_state_v = self.v_conv1d(
-                x=v,
-                cache=self.conv_state_v if use_conv_cache else None,
-                output_final_state=(args.pipe_sp_splits > 1),
-            )
-            # Detach conv states to prevent backward through previous span's graph
-            self.conv_state_q = conv_state_q.detach() if conv_state_q is not None else None
-            self.conv_state_k = conv_state_k.detach() if conv_state_k is not None else None
-            self.conv_state_v = conv_state_v.detach() if conv_state_v is not None else None
-        else:
-            # Without short conv, apply activation directly
-            if self.qk_activation == 'silu':
-                q, k = F.silu(q), F.silu(k)
-            v = F.silu(v)
-
-        # ============ Reshape to multi-head ============
-        # [b, s, num_heads_per_partition * head_dim] -> [b, s, num_heads_per_partition, head_dim]
-        q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
-        k = rearrange(k, 'b s (h d) -> b s h d', d=self.head_dim)
-        v = rearrange(v, 'b s (h d) -> b s h d', d=self.head_dim)
-
-        # ============ QK activation (if not handled by conv) ============
-        if self.use_short_conv and self.qk_activation != 'silu':
-            # Short conv already applied silu for 'silu' mode
-            if self.qk_activation == 'relu':
-                q, k = q.relu(), k.relu()
-            elif self.qk_activation == 'elu':
-                q = (F.elu(q, 1., False) + 1.).to(q)
-                k = (F.elu(k, 1., False) + 1.).to(k)
-
-        # ============ Beta ============
-        if self.use_beta:
-            # hidden_states_bsh is [b, s, h] (full seq), b_proj outputs [b, s, num_heads_per_partition]
-            beta = self.b_proj(hidden_states_bsh).sigmoid()
-        else:
-            beta = torch.ones(
-                batch_size, seq_len, self.num_attention_heads_per_partition,
-                device=hidden_states.device, dtype=hidden_states.dtype
-            )
-
-        # ============ DeltaNet core computation ============
-        # Choose mode based on sequence length
-        mode = 'fused_recurrent' if seq_len <= 64 else self.deltanet_mode
-
-        # For non-Seq1F1B paths, read initial_state from state_cache
-        initial_state = self.state_cache.get('recurrent_state', None)
-
-        # Determine if we need to output final state (for next split or not)
-        output_final_state = (args.pipe_sp_splits > 1)
-
-        if output_final_state and mode == 'chunk':
-            # Seq1F1B path: use DeltaNetChunkFunc with backward state gradient relay.
-            # State is read/written via self.state_cache dict internally,
-            # NOT passed as tensor args (to avoid autograd edges between chunks).
-            # chunk kernels currently only support bfloat16. If the caller
-            # requested full fp32 (via --fp32) we keep model params in fp32
-            # but cast the q/k/v/beta tensors to bfloat16 for the chunk
-            # kernel, then cast the output back to fp32 to preserve caller
-            # expectations.
-            orig_dtype = q.dtype
-            needs_cast = (orig_dtype == torch.float32)
-            if needs_cast:
-                q_kv_dtype = torch.bfloat16
-                q = q.to(q_kv_dtype)
-                k = k.to(q_kv_dtype)
-                v = v.to(q_kv_dtype)
-                beta = beta.to(q_kv_dtype)
-
-            o = DeltaNetChunkFunc.apply(
-                q, k, v, beta,
-                self.head_dim ** -0.5,
-                self.state_cache,
-                (self.qk_norm == 'l2'),
-            )
-
-            if needs_cast:
-                o = o.to(orig_dtype)
-            # recurrent_state is now in self.state_cache['recurrent_state']
-        elif mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_delta_rule(
-                q=q, k=k, v=v, beta=beta,
-                initial_state=initial_state,
+            output_final_state = (args.pipe_sp_splits > 1)
+            o = self._stateful_middle(
+                q, k, v, hidden_states_bsh,
+                use_conv_cache=use_conv_cache,
                 output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
             )
-            if output_final_state and recurrent_state is not None:
-                self.state_cache['recurrent_state'] = recurrent_state.detach()
-        elif mode == 'chunk':
-            # chunk_delta_rule currently enforces bfloat16 inputs. If the
-            # model was constructed in fp32 mode, cast q/k/v/beta to bfloat16
-            # for this call and cast outputs back to fp32 afterward.
-            orig_dtype = q.dtype
-            needs_cast = (orig_dtype == torch.float32)
-            if needs_cast:
-                q_kv_dtype = torch.bfloat16
-                q = q.to(q_kv_dtype)
-                k = k.to(q_kv_dtype)
-                v = v.to(q_kv_dtype)
-                beta = beta.to(q_kv_dtype)
-
-            o, recurrent_state = chunk_delta_rule(
-                q=q, k=k, v=v, beta=beta,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
-            )
-
-            if needs_cast:
-                o = o.to(orig_dtype)
-                if recurrent_state is not None:
-                    # recurrent_state may be tensor or dict; if tensor, cast
-                    try:
-                        recurrent_state = recurrent_state.to(orig_dtype)
-                    except Exception:
-                        pass
-        else:
-            raise NotImplementedError(f"DeltaNet mode `{mode}` not supported.")
 
         # ============ Output normalization & gate ============
         if self.use_gate:

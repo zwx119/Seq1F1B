@@ -603,6 +603,16 @@ def _add_deltanet_args(parser):
     group.add_argument('--deltanet-head-dim', type=int, default=None,
                        help='Per-head dimension (d_k = d_v) for DeltaNet. '
                        'If not set, defaults to kv_channels from model args.')
+    group.add_argument('--force-seq-chunks', type=int, default=1,
+                       help='DEBUG/VERIFICATION: when >1 and --pipe-sp-splits '
+                       '== 1, force DeltaNet to internally chunk its sequence '
+                       'into N pieces with state passing, replicating the '
+                       'exact kernel-call sequence Seq1F1B (pipe_sp_splits=N) '
+                       'would use. Projections, norms, FFN, etc. still run on '
+                       'the full sequence (so SP=1 + force-seq-chunks=N is '
+                       'system-level identical to SP=1 except inside the '
+                       'DeltaNet kernel). Used to prove Seq1F1B correctness '
+                       'by diffing SP=1 vs (SP=1 + force-seq-chunks=N).')
 
     return parser
 
