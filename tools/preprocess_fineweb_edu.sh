@@ -53,12 +53,23 @@ else
 fi
 
 # -------- 3. jsonl -> bin/idx --------
+# PARTITIONS > 1 splits the jsonl into N shards, each with its own reader +
+# worker pool, then merges. This bypasses the single-threaded reader
+# bottleneck in the default path and is also more robust to worker death.
+# Constraint: WORKERS must be divisible by PARTITIONS.
+PARTITIONS=${PARTITIONS:-4}
+if [ $((WORKERS % PARTITIONS)) -ne 0 ]; then
+    echo "ERROR: WORKERS (${WORKERS}) must be divisible by PARTITIONS (${PARTITIONS})"
+    exit 1
+fi
+
 if [ -f "${OUT_PREFIX}_text_document.bin" ] && [ -f "${OUT_PREFIX}_text_document.idx" ]; then
     echo ""
     echo "✓ bin/idx already built: ${OUT_PREFIX}_text_document.{bin,idx}"
 else
     echo ""
-    echo "Step 2/2: tokenizing jsonl → Megatron bin/idx (workers=${WORKERS})..."
+    echo "Step 2/2: tokenizing jsonl → Megatron bin/idx"
+    echo "          workers=${WORKERS}  partitions=${PARTITIONS}  (per-shard workers=$((WORKERS/PARTITIONS)))"
     python3 "${DIR}/tools/preprocess_data.py" \
         --input "${JSONL_PATH}" \
         --output-prefix "${OUT_PREFIX}" \
@@ -66,10 +77,27 @@ else
         --merge-file "${MERGE}" \
         --tokenizer-type GPT2BPETokenizer \
         --append-eod \
-        --workers "${WORKERS}"
+        --workers "${WORKERS}" \
+        --partitions "${PARTITIONS}"
 fi
 
 BIN_SIZE=$(du -h "${OUT_PREFIX}_text_document.bin" 2>/dev/null | awk '{print $1}')
+BIN_BYTES=$(stat -c%s "${OUT_PREFIX}_text_document.bin" 2>/dev/null || echo 0)
+
+# Sanity check: FineWeb-Edu sample-10BT should produce ~20-40GB bin.
+# Anything under 15GB almost certainly means tokenize died mid-run
+# (BrokenPipeError from crashed workers prints "✓ complete" anyway).
+MIN_EXPECTED=$((15 * 1024 * 1024 * 1024))  # 15 GB
+if [ "${BIN_BYTES}" -lt "${MIN_EXPECTED}" ]; then
+    echo ""
+    echo "⚠️  WARNING: bin size = ${BIN_SIZE} is SUSPICIOUSLY SMALL"
+    echo "    expected ~20-40GB for FineWeb-Edu sample-10BT (10B tokens)"
+    echo "    The tokenize step probably died (BrokenPipeError in workers)."
+    echo "    Please delete ${OUT_PREFIX}_text_document.{bin,idx} and re-run."
+    echo ""
+    exit 2
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════"
 echo "  ✓ Preprocessing complete"
