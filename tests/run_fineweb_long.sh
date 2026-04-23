@@ -20,6 +20,9 @@
 #     # override iters / seq_len / model size:
 #     TRAIN_ITERS=1500 SEQ_LEN=8192 bash tests/run_fineweb_long.sh
 #
+#     # resume from existing checkpoints explicitly:
+#     RESUME=1 bash tests/run_fineweb_long.sh
+#
 # Output structure:
 #     tests/fineweb_outputs/
 #         log_fineweb_sp1.txt          # full stdout (grep "validation loss" / "lm loss" here)
@@ -66,6 +69,7 @@ MIN_LR=${MIN_LR:-3.0e-5}
 WARMUP_ITERS=${WARMUP_ITERS:-200}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}
 CLIP_GRAD=${CLIP_GRAD:-1.0}
+RESUME=${RESUME:-0}
 
 # Megatron requires lr_warmup_iters < train_iters when using iteration-based
 # scheduling. Keep the long-run default for real experiments, but auto-shrink
@@ -140,6 +144,7 @@ echo "  eval         = every ${EVAL_INTERVAL} iter × ${EVAL_ITERS} batches"
 echo "  save         = every ${SAVE_INTERVAL} iter"
 echo "  OUT_DIR      = ${OUT_DIR}"
 echo "  ONLY         = ${ONLY}"
+echo "  resume       = ${RESUME}"
 if [ "${EFFECTIVE_WARMUP_ITERS}" -ne "${WARMUP_ITERS}" ]; then
     echo "  note         = warmup clipped from ${WARMUP_ITERS} to ${EFFECTIVE_WARMUP_ITERS} for short run"
 fi
@@ -160,6 +165,10 @@ run_one() {
     local TB_DIR="${OUT_DIR}/tb/${TAG}"
     local LOG_FILE="${OUT_DIR}/log_${TAG}.txt"
     mkdir -p "${CKPT_DIR}" "${TB_DIR}"
+    local LOAD_ARGS=""
+    if [ "${RESUME}" = "1" ]; then
+        LOAD_ARGS="--load ${CKPT_DIR}"
+    fi
 
     local DISTRIBUTED_ARGS="--nproc_per_node ${GPUS_PER_NODE} \
                             --nnodes 1 \
@@ -196,7 +205,6 @@ run_one() {
         --eval-iters ${EVAL_ITERS} \
         --save-interval ${SAVE_INTERVAL} \
         --save ${CKPT_DIR} \
-        --load ${CKPT_DIR} \
         --tensorboard-dir ${TB_DIR} \
         --tensorboard-queue-size 10 \
         --log-timers-to-tensorboard \
@@ -222,6 +230,7 @@ run_one() {
         --merge-file ${MERGE} \
         --split 98,2,0 \
         --tokenizer-type GPT2BPETokenizer \
+        ${LOAD_ARGS} \
     "
 
     echo ""
