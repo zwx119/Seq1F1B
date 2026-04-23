@@ -1046,9 +1046,12 @@ def send_forward_recv_forward(output_tensors, tensor_shapes, config):
         if tensor_shape is None:
             input_tensors.append(None)
             continue
-        input_tensor = p2p_communication.send_forward_recv_forward(
-            output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape, config=config
-        )
+        if parallel_state.is_pipeline_last_stage():
+            input_tensor = p2p_communication.recv_forward(tensor_shape, config) if recv_prev else None
+        else:
+            input_tensor = p2p_communication.send_forward_recv_forward(
+                output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape, config=config
+            )
         input_tensors.append(input_tensor)
     return input_tensors
 
