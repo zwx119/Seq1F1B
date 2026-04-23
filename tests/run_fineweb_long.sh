@@ -67,6 +67,17 @@ WARMUP_ITERS=${WARMUP_ITERS:-200}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}
 CLIP_GRAD=${CLIP_GRAD:-1.0}
 
+# Megatron requires lr_warmup_iters < train_iters when using iteration-based
+# scheduling. Keep the long-run default for real experiments, but auto-shrink
+# warmup for short smoke tests such as TRAIN_ITERS=20.
+if [ "${TRAIN_ITERS}" -le 1 ]; then
+    EFFECTIVE_WARMUP_ITERS=0
+elif [ "${WARMUP_ITERS}" -ge "${TRAIN_ITERS}" ]; then
+    EFFECTIVE_WARMUP_ITERS=$((TRAIN_ITERS - 1))
+else
+    EFFECTIVE_WARMUP_ITERS=${WARMUP_ITERS}
+fi
+
 # --- logging / eval / ckpt ---
 LOG_INTERVAL=${LOG_INTERVAL:-10}
 EVAL_INTERVAL=${EVAL_INTERVAL:-200}
@@ -123,12 +134,15 @@ echo "  batch        = micro=${MICRO_BATCH}  global=${GLOBAL_BATCH}"
 echo "  tokens/step  = ${TOKENS_PER_STEP}"
 echo "  train_iters  = ${TRAIN_ITERS}"
 echo "  total tokens = ${TRAIN_TOKENS}  (~$(echo ${TRAIN_TOKENS} | awk '{printf "%.2fB", $1/1e9}'))"
-echo "  lr           = ${LR} → ${MIN_LR}  (cosine, warmup ${WARMUP_ITERS})"
+echo "  lr           = ${LR} → ${MIN_LR}  (cosine, warmup ${EFFECTIVE_WARMUP_ITERS})"
 echo "  weight_decay = ${WEIGHT_DECAY}"
 echo "  eval         = every ${EVAL_INTERVAL} iter × ${EVAL_ITERS} batches"
 echo "  save         = every ${SAVE_INTERVAL} iter"
 echo "  OUT_DIR      = ${OUT_DIR}"
 echo "  ONLY         = ${ONLY}"
+if [ "${EFFECTIVE_WARMUP_ITERS}" -ne "${WARMUP_ITERS}" ]; then
+    echo "  note         = warmup clipped from ${WARMUP_ITERS} to ${EFFECTIVE_WARMUP_ITERS} for short run"
+fi
 echo "═══════════════════════════════════════════════════════════════════════"
 
 # ============================================================================
@@ -169,7 +183,7 @@ run_one() {
         --lr ${LR} \
         --min-lr ${MIN_LR} \
         --lr-decay-style cosine \
-        --lr-warmup-iters ${WARMUP_ITERS} \
+        --lr-warmup-iters ${EFFECTIVE_WARMUP_ITERS} \
         --train-iters ${TRAIN_ITERS} \
         --weight-decay ${WEIGHT_DECAY} \
         --clip-grad ${CLIP_GRAD} \
