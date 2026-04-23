@@ -3,18 +3,18 @@
 #
 # Designed for:
 #   - 4 × 80GB GPU (A100 or H100), PP=4, TP=1, DP=1
-#   - ~12h wall-clock budget (SP=1 + SP=4 sequentially)
+#   - ~12h wall-clock budget (SP=1 + SP=2 sequentially)
 #   - ~300M non-embed params, seq_len=16384, ~800M training tokens
 #
 # Usage:
-#     # default: run both SP=1 baseline and SP=4 Seq1F1B sequentially
+#     # default: run both SP=1 baseline and SP=2 Seq1F1B sequentially
 #     DATA_PREFIX=/path/to/fineweb_edu_sample_10BT_text_document \
 #     VOCAB=/path/to/gpt2/gpt2-vocab.json \
 #     MERGE=/path/to/gpt2/gpt2-merges.txt \
 #     bash tests/run_fineweb_long.sh
 #
 #     # just one config:
-#     ONLY=sp4 DATA_PREFIX=... bash tests/run_fineweb_long.sh
+#     ONLY=sp2 DATA_PREFIX=... bash tests/run_fineweb_long.sh
 #     ONLY=sp1 DATA_PREFIX=... bash tests/run_fineweb_long.sh
 #
 #     # override iters / seq_len / model size:
@@ -23,11 +23,11 @@
 # Output structure:
 #     tests/fineweb_outputs/
 #         log_fineweb_sp1.txt          # full stdout (grep "validation loss" / "lm loss" here)
-#         log_fineweb_sp4.txt
+#         log_fineweb_sp2.txt
 #         ckpt_fineweb_sp1/            # checkpoints (one every SAVE_INTERVAL)
-#         ckpt_fineweb_sp4/
+#         ckpt_fineweb_sp2/
 #         tb/fineweb_sp1/              # tensorboard (lm loss, val loss, lr, grad_norm, ...)
-#         tb/fineweb_sp4/
+#         tb/fineweb_sp2/
 #
 # Monitoring during training (separate terminal):
 #     tensorboard --logdir tests/fineweb_outputs/tb --port 6006
@@ -42,7 +42,7 @@ OUT_DIR="${OUT_DIR:-${DIR}/tests/fineweb_outputs}"
 mkdir -p "${OUT_DIR}"
 
 # --- which configs to run ---
-ONLY=${ONLY:-both}       # {sp1, sp4, both}
+ONLY=${ONLY:-both}       # {sp1, sp2, both}
 
 # --- data ---
 # Default: expect `bash tools/preprocess_fineweb_edu.sh` output.
@@ -133,7 +133,7 @@ echo "════════════════════════�
 
 # ============================================================================
 # run_one(pp_sp, tag, master_port)
-#   pp_sp       : 1 (baseline 1F1B) or 4 (Seq1F1B with 4 chunks)
+#   pp_sp       : 1 (baseline 1F1B) or 2 (Seq1F1B with 2 chunks)
 #   tag         : string used in log/ckpt/tb paths
 #   master_port : to avoid collision if two runs ever overlap
 # ============================================================================
@@ -239,17 +239,17 @@ case "${ONLY}" in
     sp1)
         run_one 1 "fineweb_sp1" 29600
         ;;
-    sp4)
-        run_one 4 "fineweb_sp4" 29601
+    sp2)
+        run_one 2 "fineweb_sp2" 29601
         ;;
     both)
-        # Run the FAST one first (SP=4) so user sees a complete curve sooner,
-        # then SP=1 baseline. If SP=4 fails, SP=1 is skipped.
-        run_one 4 "fineweb_sp4" 29601
+        # Run the Seq1F1B variant first so user sees the comparison curve sooner,
+        # then SP=1 baseline. If SP=2 fails, SP=1 is skipped.
+        run_one 2 "fineweb_sp2" 29601
         run_one 1 "fineweb_sp1" 29600
         ;;
     *)
-        echo "ERROR: ONLY must be one of {sp1, sp4, both}, got '${ONLY}'"
+        echo "ERROR: ONLY must be one of {sp1, sp2, both}, got '${ONLY}'"
         exit 1
         ;;
 esac

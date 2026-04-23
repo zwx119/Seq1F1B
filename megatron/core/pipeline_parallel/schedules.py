@@ -1060,14 +1060,21 @@ def forward_backward_pipelining_without_interleaving(
 
     def forward_send_recv(last_iteration, *args):
         args = list(args)
-        assert global_args.pipe_sp_splits == 1
-        if global_args.pipe_sp_splits != 1:
-            output_tensor = forward_step(*args)
-            send_forward_wrapper(output_tensor)
+        output_tensor = forward_step(*args)
+        if global_args.pipe_sp_splits == 1:
             if not last_iteration:
-                return recv_forward_wrapper()
+                input_tensor = send_forward_recv_forward(
+                    output_tensor, send_forward_tensor_shapes, config
+                )
             else:
-                return args[4] 
+                send_forward(output_tensor, send_forward_tensor_shapes, config)
+                input_tensor = None
+            return input_tensor
+
+        send_forward_wrapper(output_tensor)
+        if not last_iteration:
+            return recv_forward_wrapper()
+        return None
     def deallocate_output_tensor_lis(t_list, flag):
         for i in range(len(t_list)):
             deallocate_output_tensor(t_list[i], flag)
@@ -1297,17 +1304,17 @@ def forward_backward_pipelining_without_interleaving(
       
 
         if forward_only:
-            output_tensor = forward_send_recv(last_iteration,
-                            forward_step_func,                              
-                            data_iterator,
-                            model,
-                            num_microbatches*global_args.pipe_sp_splits,
-                            input_tensor,
-                            forward_data_store,
-                            config,
-                            collect_non_loss_data,
-                            checkpoint_activations_microbatch,
-                            )
+            input_tensor = forward_send_recv(last_iteration,
+                           forward_step_func,
+                           data_iterator,
+                           model,
+                           num_microbatches*global_args.pipe_sp_splits,
+                           input_tensor,
+                           forward_data_store,
+                           config,
+                           collect_non_loss_data,
+                           checkpoint_activations_microbatch,
+                           )
 
 
 
