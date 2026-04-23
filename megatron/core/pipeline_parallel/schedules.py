@@ -1037,6 +1037,22 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     return input_tensors
 
 
+def send_forward_recv_forward(output_tensors, tensor_shapes, config):
+    if not isinstance(output_tensors, list):
+        output_tensors = [output_tensors]
+    input_tensors = []
+    recv_prev = not parallel_state.is_pipeline_first_stage()
+    for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
+        if tensor_shape is None:
+            input_tensors.append(None)
+            continue
+        input_tensor = p2p_communication.send_forward_recv_forward(
+            output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape, config=config
+        )
+        input_tensors.append(input_tensor)
+    return input_tensors
+
+
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -1067,7 +1083,7 @@ def forward_backward_pipelining_without_interleaving(
                     output_tensor, send_forward_tensor_shapes, config
                 )
             else:
-                send_forward(output_tensor, send_forward_tensor_shapes, config)
+                send_forward_wrapper(output_tensor)
                 input_tensor = None
             return input_tensor
 
