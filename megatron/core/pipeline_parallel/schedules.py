@@ -1074,8 +1074,10 @@ def forward_backward_pipelining_without_interleaving(
         send_forward_wrapper(output_tensor)
         return input_tensor, output_tensor
 
-    def forward_send_recv(last_iteration, *args):
+    def forward_send_recv(last_iteration, first_iteration, *args):
         args = list(args)
+        if first_iteration and not parallel_state.is_pipeline_first_stage():
+            args[4] = recv_forward_wrapper()
         output_tensor = forward_step(*args)
         if global_args.pipe_sp_splits == 1:
             if not last_iteration:
@@ -1320,7 +1322,7 @@ def forward_backward_pipelining_without_interleaving(
       
 
         if forward_only:
-            input_tensor = forward_send_recv(last_iteration,
+            input_tensor = forward_send_recv(last_iteration, first_iteration,
                            forward_step_func,
                            data_iterator,
                            model,
