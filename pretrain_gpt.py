@@ -124,7 +124,13 @@ def loss_func(loss_mask, output_tensor):
     args = get_args()
     if get_args().pipe_sp_splits > 1:
         loss_mask_p = loss_mask_p.contiguous().view(-1).float()
-        loss = torch.sum(losses.view(-1) * loss_mask_p) / loss_mask.sum() * args.pipe_sp_splits
+        loss = torch.sum(losses.view(-1) * loss_mask_p) / loss_mask.sum()
+        # Training averages per-split losses across the expanded Seq1F1B
+        # schedule, so each split needs to be re-scaled back to the full-seq
+        # loss contribution. Evaluation sums split losses and divides by the
+        # original microbatch count, so multiplying there would double-count.
+        if torch.is_grad_enabled():
+            loss = loss * args.pipe_sp_splits
     else:
         loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
