@@ -24,6 +24,9 @@
 #     # resume from existing checkpoints explicitly:
 #     RESUME=1 bash tests/run_fineweb_long.sh
 #
+#     # disable checkpoint saving entirely:
+#     NO_SAVE=1 bash tests/run_fineweb_long.sh
+#
 # Output structure:
 #     tests/fineweb_outputs/
 #         log_fineweb_sp1.txt          # full stdout (grep "validation loss" / "lm loss" here)
@@ -88,6 +91,7 @@ LOG_INTERVAL=${LOG_INTERVAL:-10}
 EVAL_INTERVAL=${EVAL_INTERVAL:-200}
 EVAL_ITERS=${EVAL_ITERS:-20}
 SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
+NO_SAVE=${NO_SAVE:-0}
 
 # --- distributed ---
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
@@ -154,7 +158,11 @@ echo "  total tokens = ${TRAIN_TOKENS}  (~$(echo ${TRAIN_TOKENS} | awk '{printf 
 echo "  lr           = ${LR} → ${MIN_LR}  (cosine, warmup ${EFFECTIVE_WARMUP_ITERS})"
 echo "  weight_decay = ${WEIGHT_DECAY}"
 echo "  eval         = every ${EVAL_INTERVAL} iter × ${EVAL_ITERS} batches"
-echo "  save         = every ${SAVE_INTERVAL} iter"
+if [ "${NO_SAVE}" = "1" ]; then
+    echo "  save         = disabled"
+else
+    echo "  save         = every ${SAVE_INTERVAL} iter"
+fi
 echo "  OUT_DIR      = ${OUT_DIR}"
 echo "  ONLY         = ${ONLY}"
 echo "  seq1f1b_sp   = ${SEQ1F1B_SP}"
@@ -178,10 +186,21 @@ run_one() {
     local CKPT_DIR="${OUT_DIR}/ckpt_${TAG}"
     local TB_DIR="${OUT_DIR}/tb/${TAG}"
     local LOG_FILE="${OUT_DIR}/log_${TAG}.txt"
-    mkdir -p "${CKPT_DIR}" "${TB_DIR}"
+    mkdir -p "${TB_DIR}"
+    if [ "${NO_SAVE}" != "1" ]; then
+        mkdir -p "${CKPT_DIR}"
+    fi
     local LOAD_ARGS=""
     if [ "${RESUME}" = "1" ]; then
-        LOAD_ARGS="--load ${CKPT_DIR}"
+        if [ "${NO_SAVE}" = "1" ]; then
+            echo "WARNING: RESUME=1 ignored because NO_SAVE=1 disables checkpoint paths."
+        else
+            LOAD_ARGS="--load ${CKPT_DIR}"
+        fi
+    fi
+    local SAVE_ARGS=""
+    if [ "${NO_SAVE}" != "1" ]; then
+        SAVE_ARGS="--save-interval ${SAVE_INTERVAL} --save ${CKPT_DIR}"
     fi
 
     local DISTRIBUTED_ARGS="--nproc_per_node ${GPUS_PER_NODE} \
@@ -217,8 +236,7 @@ run_one() {
         --log-interval ${LOG_INTERVAL} \
         --eval-interval ${EVAL_INTERVAL} \
         --eval-iters ${EVAL_ITERS} \
-        --save-interval ${SAVE_INTERVAL} \
-        --save ${CKPT_DIR} \
+        ${SAVE_ARGS} \
         --tensorboard-dir ${TB_DIR} \
         --tensorboard-queue-size 10 \
         --log-timers-to-tensorboard \
@@ -251,7 +269,11 @@ run_one() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  ▶ Starting: ${TAG}  (PP_SP=${PP_SP}, port=${MASTER_PORT})"
     echo "    log        → ${LOG_FILE}"
-    echo "    ckpt       → ${CKPT_DIR}"
+    if [ "${NO_SAVE}" = "1" ]; then
+        echo "    ckpt       → disabled"
+    else
+        echo "    ckpt       → ${CKPT_DIR}"
+    fi
     echo "    tensorboard→ ${TB_DIR}"
     echo "    started at $(date '+%Y-%m-%d %H:%M:%S')"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
