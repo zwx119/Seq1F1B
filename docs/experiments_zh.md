@@ -25,8 +25,8 @@
 | **吞吐量** | DeltaNet 无 softmax 计算，理论上更快，但 chunk kernel 有额外开销 | ✅ 交叉点在 seq≈12K-16K；seq=32K 时 DeltaNet 1.46× 快 |
 | **Loss 收敛** | 两者架构不同，loss 绝对值不可直接比较，但各自应该正常下降 | ✅ 两者 loss 均正常下降 |
 | **PP_SP 消融** | PP_SP 增大降低显存，但过度切分增加 pipeline bubble | ✅ seq=32K 下 SP=8 最优（74,659 tok/s）；DeltaNet 在所有 SP 下均 1.41-1.75× 快于 Softmax |
-| **模型扩展** | 不同模型规模下 DeltaNet 均快于 Softmax | ✅ 1.3B 1.41×、2.7B **1.65×**、7B 1.23×；MFU 50-56% |
-| **超长序列** | DeltaNet 在 64K+ 序列下仍可训练 | ✅ seq=64K: DeltaNet ✅ (73K tok/s, MFU 81.8%) vs Softmax **OOM** ❌ |
+| **模型扩展** | 不同模型规模下 DeltaNet 均快于 Softmax | ✅ 1.3B 1.41×、2.7B **1.65×**、7B 1.23×；主要看 tok/s 与显存 |
+| **超长序列** | DeltaNet 在 64K+ 序列下仍可训练 | ✅ seq=64K: DeltaNet ✅ (73K tok/s, corrected MFU ≈25.3%) vs Softmax **OOM** ❌ |
 
 ### 核心变量
 
@@ -34,6 +34,28 @@
 - **序列长度**：4096 / 8192 / 16384 / 32768
 - **Seq1F1B 切分数**：PP_SP = 1（不切分）/ 2 / 4 / 8
 - **模型规模**：1.3B / 2.7B / 7B（TP=2）
+
+### 1.1 MFU 口径修正
+
+早期日志中打印的 `TFlops/s` 使用了 Megatron 风格的 softmax attention FLOPs 公式，
+其中包含 `seq_len^2` attention 项。这个口径适合 Softmax/FlashAttention，但会明显高估
+DeltaNet 的 FLOPs，因为 DeltaNet 的核心 attention 是线性的 recurrent/state update。
+
+本文后续表格中的 DeltaNet MFU 已按更保守的线性 DeltaNet FLOPs 重新计算：
+
+```text
+DeltaNet forward FLOPs/token/layer ≈
+  2 * (q_proj + k_proj + v_proj + gate_proj + out_proj)
++ 4 * hidden * ffn_hidden
++ beta_proj + short_conv + delta_rule_core
+
+training FLOPs ≈ 3 * forward FLOPs
+MFU = tokens_per_second * training_FLOPs_per_token / num_gpus / 312e12
+```
+
+其中 A100 BF16 Tensor Core 峰值按 312 TFLOP/s/device 计算。`tokens/s`、step time 和显存
+来自原始日志，未做修改。由于 DeltaNet 和 Softmax 的 FLOPs 定义不同，跨注意力类型比较时
+应优先看 **tokens/s、step time、显存、是否 OOM**，MFU 只作为同一口径下的辅助指标。
 
 ---
 
@@ -161,7 +183,7 @@ grep "after training is done" exp_logs/deltanet_exps/exp1_softmax_*.log
 |------|----------|---------|------|
 | Loss (iter 5) | 0.783 | 0.766 | 架构不同，绝对值不可直接比较 |
 | 吞吐量 (tok/s) | 24,873 | 54,407 | Softmax ~2.19× 快（短序列下 FlashAttention 高效） |
-| TFLOPs | 30.16 | 65.96 | |
+| Corrected TFLOPs | 26.83 | 61.76 | DeltaNet 使用线性 attention FLOPs 口径 |
 | 显存 stage 0 (GB) | 9.49 | 9.04 | |
 | 显存 stage 1 (GB) | 7.57 | 7.53 | |
 | 显存 stage 2 (GB) | 6.90 | 7.01 | |
@@ -278,14 +300,14 @@ bash run.sh 2>&1 | tee exp_logs/deltanet_exps/exp2_softmax_seq32768.log
 | 32768 | DeltaNet | 42.4 | 37.2 | 31.2 | 42.1 |
 | 32768 | Softmax | 41.7 | 37.4 | 32.9 | 43.8 |
 
-**TFLOPs/device 及 MFU**（MFU = TFLOPs / 312，A100 BF16 Tensor Core 峰值 312 TFLOPS）：
+**Corrected TFLOPs/device 及 MFU**（DeltaNet 使用线性 attention FLOPs 口径；Softmax 使用 causal softmax FLOPs 口径）：
 
 | 序列长度 | DeltaNet TFLOPs | DeltaNet MFU | Softmax TFLOPs | Softmax MFU |
 |---------|----------------|-------------|----------------|-------------|
-| 4096 | 30.16 | 9.7% | 64.14 | 20.6% |
-| 8192 | 68.91 | 22.1% | 85.62 | 27.4% |
-| 16384 | 110.73 | 35.5% | 100.17 | 32.1% |
-| 32768 | 164.79 | **52.8%** | 112.53 | 36.1% |
+| 4096 | 26.83 | 8.6% | 60.06 | 19.2% |
+| 8192 | 54.48 | 17.5% | 80.77 | 25.9% |
+| 16384 | 71.60 | 23.0% | 95.53 | 30.6% |
+| 32768 | 78.11 | 25.0% | 108.70 | 34.8% |
 
 > **核心发现**：
 >
@@ -302,9 +324,10 @@ bash run.sh 2>&1 | tee exp_logs/deltanet_exps/exp2_softmax_seq32768.log
 > - seq=32768：**DeltaNet 开始占优**（42.4 vs 43.8 GB），Softmax 的 KV cache 增长开始显现
 > - 注意：当前序列长度下，per-span 激活显存仍然是主要部分，cross-span state 的 O(1) vs O(n) 差异还未充分拉大。更长序列（64K/128K）下差异会更明显。
 >
-> **3. TFLOPs 效率**：
-> - DeltaNet 在长序列下的 TFLOPs 远高于 Softmax（164.79 vs 112.53 @seq=32K）
-> - 这说明 DeltaNet 的计算密度更高，GPU 利用率更好
+> **3. MFU 口径修正后的解读**：
+> - DeltaNet 的 corrected TFLOPs 不再随 `seq_len^2` 虚高，seq=32K 时约 78.11 TFLOPs/device。
+> - DeltaNet 的优势主要体现在 **更少实际计算量带来的更高 tokens/s**，而不是更高 MFU。
+> - 因此跨 DeltaNet/Softmax 对比时，应优先使用吞吐量和显存；MFU 只做辅助参考。
 
 ---
 
@@ -363,19 +386,19 @@ bash run_deltanet.sh 2>&1 | tee exp_logs/deltanet_exps/exp3_deltanet_seq32k_sp8.
 
 | PP_SP | 每 span 长度 | 显存 (max stage, GB) | 吞吐量 (tok/s) | TFLOPs | 每步耗时 (ms) | MFU | 相对 SP=1 吞吐 |
 |-------|------------|---------------------|---------------|--------|-------------|-----|--------------|
-| 1 | 32768 | 76.3 | 64,775 | 147.40 | 4,047 | 47.2% | 1.00× |
-| 2 | 16384 | 53.9 | 71,033 | 161.64 | 3,691 | 51.8% | **1.10×** |
-| 4 | 8192 | 42.4 | 69,780 | 158.79 | 3,761 | 50.9% | 1.08× |
-| 8 | 4096 | 35.4 | 74,659 | 169.89 | 3,512 | 54.5% | **1.15×** ★ |
+| 1 | 32768 | 76.3 | 64,775 | 69.87 | 4,047 | 22.4% | 1.00× |
+| 2 | 16384 | 53.9 | 71,033 | 76.62 | 3,691 | 24.6% | **1.10×** |
+| 4 | 8192 | 42.4 | 69,780 | 75.27 | 3,761 | 24.1% | 1.08× |
+| 8 | 4096 | 35.4 | 74,659 | 80.53 | 3,512 | 25.8% | **1.15×** ★ |
 
 **Softmax (FlashAttention) 对照：**
 
 | PP_SP | 每 span 长度 | 显存 (max stage, GB) | 吞吐量 (tok/s) | TFLOPs | 每步耗时 (ms) | MFU | 相对 SP=1 吞吐 |
 |-------|------------|---------------------|---------------|--------|-------------|-----|--------------|
-| 1 | 32768 | 60.6 | 36,999 | 84.19 | 7,085 | 27.0% | 1.00× |
-| 2 | 16384 | 48.6 | 45,045 | 102.50 | 5,820 | 32.9% | 1.22× |
-| 4 | 8192 | 43.8 | 49,500 | 112.64 | 5,296 | 36.1% | 1.34× |
-| 8 | 4096 | 40.8 | 50,455 | 114.81 | 5,196 | 36.8% | **1.36×** |
+| 1 | 32768 | 60.6 | 36,999 | 81.33 | 7,085 | 26.1% | 1.00× |
+| 2 | 16384 | 48.6 | 45,045 | 99.02 | 5,820 | 31.7% | 1.22× |
+| 4 | 8192 | 43.8 | 49,500 | 108.82 | 5,296 | 34.9% | 1.34× |
+| 8 | 4096 | 40.8 | 50,455 | 110.91 | 5,196 | 35.5% | **1.36×** |
 
 **DeltaNet vs Softmax 对比：**
 
@@ -415,8 +438,9 @@ bash run_deltanet.sh 2>&1 | tee exp_logs/deltanet_exps/exp3_deltanet_seq32k_sp8.
 > 但 DeltaNet 提升幅度更大（+15% vs +36%）。Softmax 从 SP=4→SP=8 提升仅 2%，
 > 说明 Softmax 在高 SP 下被 KV cache 通信拖累。
 >
-> **4. MFU 对比鲜明**：
-> DeltaNet MFU 47-55%，Softmax MFU 27-37%。DeltaNet 的 GPU 利用率全面碾压。
+> **4. Corrected MFU 解读**：
+> DeltaNet corrected MFU 约 22-26%，Softmax 约 26-36%。这并不削弱吞吐结论：
+> DeltaNet 是用更少的实际 FLOPs 跑出更高 tokens/s，而不是依赖更高的 softmax-style MFU。
 >
 > **5. 关键启示**：PP_SP 的最优值取决于 **每 span 的绝对长度**，而非 SP 数本身。
 > 每 span ≥ 4096 tokens 时 DeltaNet 能充分利用 GPU 并行度。
@@ -428,10 +452,10 @@ bash run_deltanet.sh 2>&1 | tee exp_logs/deltanet_exps/exp3_deltanet_seq32k_sp8.
 
 | PP_SP | 每 span 长度 | 显存 (max stage, GB) | 吞吐量 (tok/s) | TFLOPs | 相对 SP=1 吞吐 |
 |-------|------------|---------------------|---------------|--------|--------------|
-| 1 | 8192 | 22.8 | 60,180 | 82.10 | 1.00× |
-| 2 | 4096 | 16.9 | 64,601 | 88.13 | 1.07× |
-| 4 | 2048 | 13.9 | 57,398 | 78.31 | 0.95× |
-| 8 | 1024 | 12.6 | 33,631 | 45.88 | 0.56× |
+| 1 | 8192 | 22.8 | 60,180 | 64.91 | 1.00× |
+| 2 | 4096 | 16.9 | 64,601 | 69.68 | 1.07× |
+| 4 | 2048 | 13.9 | 57,398 | 61.91 | 0.95× |
+| 8 | 1024 | 12.6 | 33,631 | 36.28 | 0.56× |
 
 > seq=8K 下 SP=8（span=1024）吞吐暴跌 44%，但 seq=32K 下 SP=8（span=4096）反而最优。
 > 这验证了 **"每 span 绝对长度 ≥ 4096"** 是保持高吞吐的下限。
@@ -507,24 +531,24 @@ bash run.sh 2>&1 | tee exp_logs/deltanet_exps/exp4_softmax_7b_seq32k.log
 ### 6.3 结果表格
 
 > 数据均取 iter≥2 的平均值，**seq=32768**，PP=4，PP_SP=4。
-> MFU = TFLOPs / 312（A100 BF16 Tensor Core 理论峰值 312 TFLOPS）。
+> MFU 使用 1.1 节的 corrected FLOPs 口径，A100 BF16 Tensor Core 峰值按 312 TFLOPS/device。
 > 1.3B Softmax 数据复用实验二 `exp2_softmax_seq32768.log`（相同配置）。
 
 **DeltaNet：**
 
 | 模型 | TP | 显存 (max stage, GB) | 吞吐量 (tok/s) | TFLOPs | 每步耗时 (ms) | MFU |
 |------|---|---------------------|---------------|--------|-------------|-----|
-| 1.3B | 1 | 42.4 | 69,705 | 158.62 | 3,766 | 50.8% |
-| 2.7B | 1 | 72.3 | 42,411 | 174.42 | 6,181 | 55.9% |
-| 7B | 2 | 69.6 | 20,241 | 169.65 | 12,952 | 54.4% |
+| 1.3B | 1 | 42.4 | 69,705 | 75.19 | 3,766 | 24.1% |
+| 2.7B | 1 | 72.3 | 42,411 | 91.76 | 6,181 | 29.4% |
+| 7B | 2 | 69.6 | 20,241 | 110.19 | 12,952 | 35.3% |
 
 **Softmax (FlashAttention)：**
 
 | 模型 | TP | 显存 (max stage, GB) | 吞吐量 (tok/s) | TFLOPs | 每步耗时 (ms) | MFU |
 |------|---|---------------------|---------------|--------|-------------|-----|
-| 1.3B | 1 | 43.8 | 49,450 | 112.53 | 5,301 | 36.1% |
-| 2.7B | 1 | 69.5 | 25,671 | 105.58 | 10,212 | 33.8% |
-| 7B | 2 | 67.8 | 16,407 | 137.52 | 15,978 | 44.1% |
+| 1.3B | 1 | 43.8 | 49,450 | 108.70 | 5,301 | 34.8% |
+| 2.7B | 1 | 69.5 | 25,671 | 103.10 | 10,212 | 33.0% |
+| 7B | 2 | 67.8 | 16,407 | 134.98 | 15,978 | 43.3% |
 
 **DeltaNet vs Softmax 对比：**
 
@@ -565,10 +589,10 @@ bash run.sh 2>&1 | tee exp_logs/deltanet_exps/exp4_softmax_7b_seq32k.log
 > - 2.7B Softmax stage 0 达 69.5GB，DeltaNet 达 72.3GB，两者均接近 80GB 上限。
 >   更长序列（64K+）时 Softmax 的 KV cache O(n) 增长会使其率先 OOM。
 >
-> **4. MFU 对比**：
-> - DeltaNet MFU 50-56%，Softmax MFU 34-44%
-> - DeltaNet 的 MFU 在所有规模上都显著高于 Softmax，说明线性注意力更能充分利用 GPU 算力
-> - 7B Softmax MFU (44.1%) 高于 2.7B (33.8%)：因为 7B 用了 TP=2 将 hidden=4096 拆分，
+> **4. Corrected MFU 对比**：
+> - DeltaNet corrected MFU 约 24-35%，Softmax 约 33-43%。
+> - 这说明 DeltaNet 的核心收益是 **减少实际 FLOPs 并提升 tokens/s**，而不是在 softmax-style MFU 上更高。
+> - 7B Softmax MFU (43.3%) 高于 2.7B (33.0%)：因为 7B 用了 TP=2 将 hidden=4096 拆分，
 >   每 GPU 的计算仍然高效；而 2.7B 的 head_dim=80 对 Tensor Core 不友好（非 8 的倍数 padding）
 >
 > **5. 可重复性验证**：
@@ -603,8 +627,8 @@ bash run.sh 2>&1 | tee exp_logs/deltanet_exps/exp4_softmax_7b_seq32k.log
 | 指标 | 值 |
 |------|-----|
 | 吞吐量 (tok/s) | 73,150 |
-| TFLOPs | 255.33 |
-| MFU | **81.8%** ★ |
+| Corrected TFLOPs | 78.90 |
+| Corrected MFU | **25.3%** |
 | 每步耗时 (ms) | 7,174 |
 | 显存 Peak (GB) | 75.3 (Stage 3) |
 | 显存各 stage | 60.9, 57.7, 54.9, 75.3 |
@@ -618,10 +642,11 @@ bash run.sh 2>&1 | tee exp_logs/deltanet_exps/exp4_softmax_7b_seq32k.log
 > - **这是论文中最有说服力的数据点**：同样的硬件、同样的模型、同样的序列长度——
 >   DeltaNet 跑通了，Softmax 跑不了。
 >
-> **2. MFU 飙升至 81.8%**：
-> - seq=32K 时 DeltaNet 最高 MFU 54.5%（SP=8），seq=64K 时达 **81.8%**
-> - 更长序列 → 更高计算密度 → GPU 算力利用率更充分
-> - 这也解释了 DeltaNet tok/s 在 seq=64K 下几乎没有下降（73,150 vs seq=32K 的 74,659）
+> **2. Corrected MFU 后的解读**：
+> - 旧口径下 81.8% 来自 softmax-style `seq_len^2` FLOPs 估计，对 DeltaNet 不适用。
+> - 线性 DeltaNet 口径下 corrected MFU 约 **25.3%**。
+> - 更关键的结果仍然成立：DeltaNet 在 seq=64K 下 tokens/s 几乎没有下降（73,150 vs seq=32K 的 74,659），
+>   而 Softmax 在相同配置下 OOM。
 >
 > **3. DeltaNet seq=64K SP=8 也 OOM（span=8192）**：
 > - iter 1 时显存已达 75.9GB（Stage 3），iter 2 OOM
@@ -665,8 +690,8 @@ done
 1. **吞吐量 vs 序列长度**（实验二，最关键的图）：X 轴=序列长度，Y 轴=tok/s，两条线（DeltaNet / Softmax）
    - ✅ **已验证**：交叉点在 seq≈12K-16K，seq=32K 时 DeltaNet 1.46× 快
 
-2. **TFLOPs vs 序列长度**（实验二）：X 轴=序列长度，Y 轴=TFLOPs/device
-   - ✅ **已验证**：DeltaNet 在 seq=32K 时达 164.79 TFLOPs，Softmax 仅 112.53
+2. **Corrected TFLOPs vs 序列长度**（实验二）：X 轴=序列长度，Y 轴=TFLOPs/device
+   - ✅ **已修正**：DeltaNet corrected TFLOPs 不再使用 softmax 二次项；seq=32K 时约 78.11 TFLOPs/device
 
 3. **显存 vs 序列长度**（实验二）：X 轴=序列长度，Y 轴=显存(GB)，两条线
    - ✅ **已验证**：两者显存增长趋势类似，但 seq=32K 时 DeltaNet 开始占优（42.4 vs 43.8）
@@ -677,8 +702,8 @@ done
    - ✅ **已验证**：内存从 76.3→35.4GB 单调下降；吞吐量 SP=8 最优（74,659 tok/s）
    - 关键发现：seq=32K 下 SP=8（span=4096）不再暴跌，与 seq=8K 下 SP=8（span=1024）截然不同
 
-5. **MFU vs 模型规模**（实验四）：X 轴=模型规模，Y 轴=MFU(%)
-   - ✅ **已验证**：DeltaNet MFU 50-56%，Softmax MFU 34-44%，全面领先
+5. **Corrected MFU vs 模型规模**（实验四）：X 轴=模型规模，Y 轴=MFU(%)
+   - ✅ **已修正**：DeltaNet corrected MFU 约 24-35%，Softmax 约 33-43%；跨注意力类型不再用 MFU 作为主结论
 
 6. **吞吐量加速比 vs 模型规模**（实验四，新增核心图）：X 轴=模型规模，Y 轴=DeltaNet/Softmax 吞吐比
    - ✅ **已验证**：1.3B 1.41×、2.7B **1.65×** ★、7B 1.23×
@@ -688,7 +713,7 @@ done
    - ✅ **关键结论**：每 span ≥ 4096 tokens 时吞吐稳定，< 2048 时开始暴跌
 
 8. **seq=64K 可行性对比**（实验五，最有冲击力的图）：柱状图或表格
-   - ✅ DeltaNet SP=16: 73,150 tok/s, 75.3GB → **成功**
+   - ✅ DeltaNet SP=16: 73,150 tok/s, corrected MFU 25.3%, 75.3GB → **成功**
    - ❌ Softmax SP=16: OOM (77.0GB, KV cache 累积) → **失败**
    - 一张图说明一切："DeltaNet 能训练 64K 序列，Softmax 不能"
 
