@@ -105,6 +105,7 @@ PP_SIZE=${PP_SIZE:-${GPUS_PER_NODE}}
 TP_SIZE=${TP_SIZE:-1}
 SEQ1F1B_SP=${SEQ1F1B_SP:-${PP_SIZE}}
 SEQ_TAG="fineweb_sp${SEQ1F1B_SP}"
+TORCHRUN_STANDALONE=${TORCHRUN_STANDALONE:-0}
 
 if [ "${SEQ1F1B_SP}" -lt 2 ]; then
     echo "ERROR: SEQ1F1B_SP must be >= 2, got '${SEQ1F1B_SP}'"
@@ -167,6 +168,7 @@ echo "  OUT_DIR      = ${OUT_DIR}"
 echo "  ONLY         = ${ONLY}"
 echo "  seq1f1b_sp   = ${SEQ1F1B_SP}"
 echo "  resume       = ${RESUME}"
+echo "  torchrun     = $([ "${TORCHRUN_STANDALONE}" = "1" ] && echo standalone || echo c10d)"
 if [ "${EFFECTIVE_WARMUP_ITERS}" -ne "${WARMUP_ITERS}" ]; then
     echo "  note         = warmup clipped from ${WARMUP_ITERS} to ${EFFECTIVE_WARMUP_ITERS} for short run"
 fi
@@ -203,12 +205,22 @@ run_one() {
         SAVE_ARGS="--save-interval ${SAVE_INTERVAL} --save ${CKPT_DIR}"
     fi
 
-    local DISTRIBUTED_ARGS="--nproc_per_node ${GPUS_PER_NODE} \
-                            --nnodes 1 \
-                            --rdzv_id=1 \
-                            --rdzv_backend=c10d \
-                            --rdzv_endpoint=localhost:${MASTER_PORT} \
-                            --max_restarts=0"
+    local DISTRIBUTED_ARGS
+    local LAUNCH_DESC
+    if [ "${TORCHRUN_STANDALONE}" = "1" ]; then
+        DISTRIBUTED_ARGS="--standalone \
+                          --nproc_per_node ${GPUS_PER_NODE} \
+                          --max_restarts=0"
+        LAUNCH_DESC="standalone"
+    else
+        DISTRIBUTED_ARGS="--nproc_per_node ${GPUS_PER_NODE} \
+                          --nnodes 1 \
+                          --rdzv_id=1 \
+                          --rdzv_backend=c10d \
+                          --rdzv_endpoint=localhost:${MASTER_PORT} \
+                          --max_restarts=0"
+        LAUNCH_DESC="port=${MASTER_PORT}"
+    fi
 
     local options=" \
         --tensor-model-parallel-size ${TP_SIZE} \
@@ -267,7 +279,7 @@ run_one() {
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  ▶ Starting: ${TAG}  (PP_SP=${PP_SP}, port=${MASTER_PORT})"
+    echo "  ▶ Starting: ${TAG}  (PP_SP=${PP_SP}, ${LAUNCH_DESC})"
     echo "    log        → ${LOG_FILE}"
     if [ "${NO_SAVE}" = "1" ]; then
         echo "    ckpt       → disabled"
