@@ -38,6 +38,7 @@ WARMUP_ITERS="${WARMUP_ITERS:-10}"
 EVAL_ITERS="${EVAL_ITERS:-0}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-100000}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Use the local FLA fork when present. This avoids accidentally importing a
 # broken site-packages namespace package on the training machine.
@@ -61,6 +62,9 @@ echo "  seq/micro/global     = ${SEQ_LEN}/${MICRO_BATCH}/${GLOBAL_BATCH}"
 echo "  iters/warmup         = ${TRAIN_ITERS}/${WARMUP_ITERS}"
 echo "  FLA_DIR              = ${FLA_DIR}"
 echo "  FLA_USE_FUSED_SOLVE_WU = ${FLA_USE_FUSED_SOLVE_WU}"
+if [ -n "${EXTRA_ARGS}" ]; then
+    echo "  EXTRA_ARGS           = ${EXTRA_ARGS}"
+fi
 echo "═══════════════════════════════════════════════════════════════════════"
 
 declare -a RUN_STATUSES=()
@@ -96,6 +100,7 @@ run_config() {
     EVAL_ITERS="${EVAL_ITERS}" \
     SAVE_INTERVAL="${SAVE_INTERVAL}" \
     LOG_INTERVAL="${LOG_INTERVAL}" \
+    EXTRA_ARGS="${EXTRA_ARGS}" \
     ONLY="${only}" \
     bash "${RUNNER}"
 

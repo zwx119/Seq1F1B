@@ -1449,6 +1449,43 @@ def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
         return default_layer_type
 
 
+def _parse_layer_selection(spec):
+    """Parse comma-separated 1-indexed layer ids/ranges such as "4,8-10"."""
+    layers = set()
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '-' in item:
+            start_s, end_s = item.split('-', 1)
+            start = int(start_s)
+            end = int(end_s)
+            if start <= 0 or end <= 0 or end < start:
+                raise ValueError(f"invalid layer range: {item}")
+            layers.update(range(start, end + 1))
+        else:
+            layer = int(item)
+            if layer <= 0:
+                raise ValueError("hybrid attention layers are 1-indexed")
+            layers.add(layer)
+    return layers
+
+
+def _use_softmax_attention_in_deltanet_hybrid(args, layer_number):
+    """Return True when this global layer should be a softmax attention layer."""
+    explicit_layers = getattr(args, 'deltanet_hybrid_attention_layers', '')
+    if explicit_layers.strip():
+        if layer_number in _parse_layer_selection(explicit_layers):
+            return True
+
+    period = getattr(args, 'deltanet_hybrid_attention_period', 0)
+    if period > 0:
+        offset = getattr(args, 'deltanet_hybrid_attention_offset', 0)
+        return (layer_number - offset) % period == 0
+
+    return False
+
+
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -1558,15 +1595,18 @@ class ParallelTransformer(MegatronModule):
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,
                     layer_number)
-                # Use DeltaNet linear attention layer if --use-deltanet
+                # Use DeltaNet linear attention layer if --use-deltanet. Hybrid
+                # mode leaves selected global layers as regular softmax
+                # attention, so the outer transformer stack stays unchanged.
                 if getattr(args, 'use_deltanet', False):
-                    from megatron.model.deltanet_layer import DeltaNetTransformerLayer
-                    return DeltaNetTransformerLayer(
-                        config,
-                        layer_number,
-                        layer_type=current_layer_type,
-                        self_attn_mask_type=self_attn_mask_type,
-                        drop_path_rate=self.drop_path_rates[layer_number - 1])
+                    if not _use_softmax_attention_in_deltanet_hybrid(args, layer_number):
+                        from megatron.model.deltanet_layer import DeltaNetTransformerLayer
+                        return DeltaNetTransformerLayer(
+                            config,
+                            layer_number,
+                            layer_type=current_layer_type,
+                            self_attn_mask_type=self_attn_mask_type,
+                            drop_path_rate=self.drop_path_rates[layer_number - 1])
                 return ParallelTransformerLayer(
                     config,
                     layer_number,

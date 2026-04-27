@@ -379,16 +379,35 @@ def validate_args(args, defaults={}):
 
     # DeltaNet: override positional embedding settings.
     if args.use_deltanet:
+        deltanet_hybrid_attention = (
+            bool(getattr(args, 'deltanet_hybrid_attention_layers', '').strip())
+            or getattr(args, 'deltanet_hybrid_attention_period', 0) > 0
+        )
         # DeltaNet uses short convolutions instead of positional embeddings.
         # Disable RoPE and learned absolute PE to avoid conflicts.
         args.position_embedding_type = 'none'
         args.add_position_embedding = False
         args.use_rotary_position_embeddings = False
-        # DeltaNet is incompatible with flash attention (they are alternatives)
-        if args.use_flash_attn:
+        # Pure DeltaNet is incompatible with flash attention (they are
+        # alternatives). In hybrid mode, softmax attention layers can still use
+        # FlashAttention while DeltaNet layers ignore the flag.
+        if args.use_flash_attn and not deltanet_hybrid_attention:
             raise RuntimeError(
                 '--use-deltanet and --use-flash-attn are mutually exclusive. '
-                'DeltaNet replaces softmax attention entirely.')
+                'DeltaNet replaces softmax attention entirely. Use '
+                '--deltanet-hybrid-attention-* to mix in softmax layers.')
+        if deltanet_hybrid_attention and args.pipe_sp_splits > 1 and not args.use_flash_attn:
+            raise RuntimeError(
+                'Hybrid DeltaNet with --pipe-sp-splits > 1 requires '
+                '--use-flash-attn for the softmax attention layers.')
+        if getattr(args, 'deltanet_hybrid_attention_period', 0) < 0:
+            raise RuntimeError('--deltanet-hybrid-attention-period must be >= 0')
+        if getattr(args, 'deltanet_hybrid_attention_offset', 0) < 0:
+            raise RuntimeError('--deltanet-hybrid-attention-offset must be >= 0')
+        if getattr(args, 'deltanet_hybrid_attention_layers', '').strip():
+            _parse_int_list_or_ranges(
+                args.deltanet_hybrid_attention_layers,
+                '--deltanet-hybrid-attention-layers')
         # DeltaNet requires fla library
         try:
             from fla.ops.delta_rule import chunk_delta_rule  # noqa: F401
@@ -428,6 +447,29 @@ def _print_args(title, args):
 
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
+
+def _parse_int_list_or_ranges(spec, arg_name):
+    """Parse comma-separated 1-indexed integers/ranges such as "2,4,8-10"."""
+    values = set()
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '-' in item:
+            start_s, end_s = item.split('-', 1)
+            start = int(start_s)
+            end = int(end_s)
+            if start <= 0 or end <= 0 or end < start:
+                raise RuntimeError(
+                    f'{arg_name} has invalid layer range: {item}')
+            values.update(range(start, end + 1))
+        else:
+            value = int(item)
+            if value <= 0:
+                raise RuntimeError(
+                    f'{arg_name} must contain positive 1-indexed layers')
+            values.add(value)
+    return values
 
 def core_transformer_config_from_args(args):
 
@@ -603,6 +645,19 @@ def _add_deltanet_args(parser):
     group.add_argument('--deltanet-head-dim', type=int, default=None,
                        help='Per-head dimension (d_k = d_v) for DeltaNet. '
                        'If not set, defaults to kv_channels from model args.')
+    group.add_argument('--deltanet-hybrid-attention-layers', type=str, default='',
+                       help='Comma-separated 1-indexed transformer layers that '
+                       'should use standard softmax self-attention instead of '
+                       'DeltaNet, e.g. "4,8,12" or "4,8-10". Empty means all '
+                       'layers use DeltaNet.')
+    group.add_argument('--deltanet-hybrid-attention-period', type=int, default=0,
+                       help='When >0, every N-th transformer layer uses '
+                       'standard softmax self-attention instead of DeltaNet. '
+                       'For example, 4 selects layers 4,8,12,... . Default: 0.')
+    group.add_argument('--deltanet-hybrid-attention-offset', type=int, default=0,
+                       help='Offset for --deltanet-hybrid-attention-period. '
+                       'The default 0 selects layers N,2N,3N,...; offset 1 '
+                       'selects layers 1,1+N,1+2N,... .')
     group.add_argument('--force-seq-chunks', type=int, default=1,
                        help='DEBUG/VERIFICATION: when >1 and --pipe-sp-splits '
                        '== 1, force DeltaNet to internally chunk its sequence '

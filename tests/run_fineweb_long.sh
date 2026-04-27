@@ -92,6 +92,7 @@ EVAL_INTERVAL=${EVAL_INTERVAL:-200}
 EVAL_ITERS=${EVAL_ITERS:-20}
 SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
 NO_SAVE=${NO_SAVE:-0}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 # --- distributed ---
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
@@ -169,6 +170,9 @@ echo "  ONLY         = ${ONLY}"
 echo "  seq1f1b_sp   = ${SEQ1F1B_SP}"
 echo "  resume       = ${RESUME}"
 echo "  torchrun     = $([ "${TORCHRUN_STANDALONE}" = "1" ] && echo standalone || echo c10d)"
+if [ -n "${EXTRA_ARGS}" ]; then
+    echo "  extra args   = ${EXTRA_ARGS}"
+fi
 if [ "${EFFECTIVE_WARMUP_ITERS}" -ne "${WARMUP_ITERS}" ]; then
     echo "  note         = warmup clipped from ${WARMUP_ITERS} to ${EFFECTIVE_WARMUP_ITERS} for short run"
 fi
@@ -275,6 +279,7 @@ run_one() {
         --split 98,2,0 \
         --tokenizer-type GPT2BPETokenizer \
         ${LOAD_ARGS} \
+        ${EXTRA_ARGS} \
     "
 
     echo ""
