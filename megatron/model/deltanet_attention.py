@@ -111,6 +111,7 @@ class ShortConvChunkFunc(torch.autograd.Function):
             x=x,
             weight=weight_dw,
             bias=bias,
+            residual=None,
             initial_state=initial_state,
             output_final_state=True,
             activation=activation,
