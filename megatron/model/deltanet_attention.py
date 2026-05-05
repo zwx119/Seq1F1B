@@ -39,6 +39,7 @@ except ImportError:
 try:
     from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
     from fla.ops.delta_rule.chunk import chunk_delta_rule_fwd, chunk_delta_rule_bwd
+    from fla.modules.conv.triton.ops import causal_conv1d_fwd, causal_conv1d_bwd
     from fla.modules.l2norm import l2norm_fwd, l2norm_bwd
     from fla.ops.utils.index import prepare_chunk_indices
     from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -77,17 +78,16 @@ except ImportError:
 # chunk-by-chunk backward never tries to traverse back through a previous
 # chunk's autograd graph.
 #
-# Forward  (chunk N):  prefix := conv_cache[name]         (detached)
-#                      y      := F.conv1d([prefix;x], W) + activation
-#                      conv_cache[name] := x[-W+1:]        (detached)
-# Backward (chunk N):  d_from_next := conv_grad[name]      (written by N+1)
-#                      dx[-W+1:] += d_from_next
-#                      dx, dw, db, d_prefix := conv1d_bwd
-#                      conv_grad[name] := d_prefix          (read by N-1)
+# Forward  (chunk N):  state := conv_cache[name]
+#                      y, final_state := FLA Triton causal_conv1d(x, state)
+#                      conv_cache[name] := final_state
+# Backward (chunk N):  d_final_state := conv_grad[name]    (written by N+1)
+#                      dx, dw, db, d_state := FLA Triton causal_conv1d_bwd
+#                      conv_grad[name] := d_state           (read by N-1)
 # ============================================================================
 
 class ShortConvChunkFunc(torch.autograd.Function):
-    """Depthwise causal 1-D convolution with Seq1F1B cross-chunk gradient relay.
+    """FLA causal conv1d with Seq1F1B cross-chunk gradient relay.
 
     Parameters
     ----------
@@ -101,89 +101,52 @@ class ShortConvChunkFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, bias, cache_dict, grad_dict, name, activation):
-        B, T, D = x.shape
-        W = weight.shape[-1]
+        # FLA stores causal-conv state as [B, D, W]. The returned final_state
+        # is produced inside this custom forward, so autograd cannot see an
+        # edge to the previous chunk; gradients are relayed manually below.
+        weight_dw = rearrange(weight, "d 1 w -> d w")
+        initial_state = cache_dict.get(name, None)
+        had_state = initial_state is not None
+        y, final_state = causal_conv1d_fwd(
+            x=x,
+            weight=weight_dw,
+            bias=bias,
+            initial_state=initial_state,
+            output_final_state=True,
+            activation=activation,
+        )
+        cache_dict[name] = final_state
 
-        prefix = cache_dict.get(name, None)  # [B, W-1, D] detached, or None
-        had_prefix = prefix is not None
-        if not had_prefix:
-            prefix = x.new_zeros(B, W - 1, D)
-
-        # [B, W-1+T, D] → depthwise conv1d → [B, T, D]
-        x_full = torch.cat([prefix, x], dim=1)
-        x_full_bdt = x_full.transpose(1, 2).contiguous()
-        y_pre_bdt = F.conv1d(x_full_bdt, weight, bias=bias, groups=D)
-        y_pre = y_pre_bdt.transpose(1, 2).contiguous()
-
-        if activation in ('silu', 'swish'):
-            y = F.silu(y_pre)
-        elif activation is None:
-            y = y_pre
-        else:
-            raise ValueError(f"ShortConvChunkFunc: unsupported activation `{activation}`")
-
-        # Write this chunk's tail to the cache for the next chunk.
-        # Detach+clone to guarantee no autograd edge leaks across chunks.
-        if T >= W - 1:
-            new_cache = x[:, -(W - 1):, :].detach().clone()
-        else:
-            # Short chunk: blend previous prefix with whole x
-            new_cache = torch.cat([prefix[:, T:, :], x], dim=1).detach().clone()
-        cache_dict[name] = new_cache
-
-        ctx.save_for_backward(x, weight, prefix, y_pre)
+        ctx.save_for_backward(x, weight_dw, bias, initial_state)
         ctx.activation = activation
-        ctx.has_bias = bias is not None
         ctx.grad_dict = grad_dict
         ctx.name = name
-        ctx.had_prefix = had_prefix
+        ctx.had_state = had_state
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        x, weight, prefix, y_pre = ctx.saved_tensors
-        B, T, D = x.shape
-        W = weight.shape[-1]
+        x, weight_dw, bias, initial_state = ctx.saved_tensors
+        dht = ctx.grad_dict.pop(ctx.name, None)
 
-        # Activation backward (silu derivative = sigmoid(x) + x*sig*(1-sig))
-        if ctx.activation in ('silu', 'swish'):
-            s = torch.sigmoid(y_pre)
-            dy = dy * (s + y_pre * s * (1.0 - s))
-
-        # Conv1d backward on the full [prefix;x] input
-        x_full = torch.cat([prefix, x], dim=1)
-        x_full_bdt = x_full.transpose(1, 2).contiguous()
-        dy_bdt = dy.transpose(1, 2).contiguous()
-
-        dx_full_bdt = torch.nn.grad.conv1d_input(
-            input_size=x_full_bdt.shape, weight=weight,
-            grad_output=dy_bdt, groups=D,
+        dx, dw, db, _, dh0 = causal_conv1d_bwd(
+            x=x,
+            dy=dy,
+            dht=dht,
+            weight=weight_dw,
+            bias=bias,
+            initial_state=initial_state,
+            activation=ctx.activation,
         )
-        dw = torch.nn.grad.conv1d_weight(
-            input=x_full_bdt, weight_size=weight.shape,
-            grad_output=dy_bdt, groups=D,
-        )
-        db = dy_bdt.sum(dim=(0, 2)) if ctx.has_bias else None
 
-        dx_full = dx_full_bdt.transpose(1, 2).contiguous()
-        dx_prefix = dx_full[:, :W - 1, :].contiguous()   # grad wrt previous chunk's tail
-        dx = dx_full[:, W - 1:, :].contiguous()          # grad wrt this chunk's x
-
-        # Absorb gradient flowing back from the next chunk (written by its
-        # backward into grad_dict[name] as its own dx_prefix).
-        d_from_next = ctx.grad_dict.pop(ctx.name, None)
-        if d_from_next is not None:
-            # d_from_next shape [B, W-1, D] — add to this chunk's tail grad.
-            dx[:, -(W - 1):, :] = dx[:, -(W - 1):, :] + d_from_next
-
-        # Publish dx_prefix for the previous chunk's backward. Chunk 0 has no
-        # previous chunk; we still write but _clear_states() clears it before
-        # the next microbatch starts.
-        if ctx.had_prefix:
-            ctx.grad_dict[ctx.name] = dx_prefix
+        # Publish gradient wrt this chunk's initial state for the previous
+        # chunk. Chunk 0 has no previous chunk; _clear_states() clears any
+        # stale entry before the next microbatch starts.
+        if ctx.had_state and dh0 is not None:
+            ctx.grad_dict[ctx.name] = dh0
 
         # grads for (x, weight, bias, cache_dict, grad_dict, name, activation)
-        return dx, dw, db, None, None, None, None
+        return dx, rearrange(dw, "d w -> d 1 w"), db, None, None, None, None
 
 
 # ============================================================================
@@ -355,32 +318,46 @@ class DeltaNetAttention(MegatronModule):
         self.qk_norm = getattr(args, 'deltanet_qk_norm', 'l2')
         self.deltanet_mode = getattr(args, 'deltanet_mode', 'chunk')
 
-        # Q, K, V projections with tensor parallelism
-        # ColumnParallelLinear splits the output dimension across TP ranks
-        self.q_proj = tensor_parallel.ColumnParallelLinear(
-            self.hidden_size,
-            self.hidden_size,  # = num_heads * head_dim
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            gather_output=False,  # Keep split across TP ranks
-        )
-        self.k_proj = tensor_parallel.ColumnParallelLinear(
-            self.hidden_size,
-            self.hidden_size,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            gather_output=False,
-        )
-        self.v_proj = tensor_parallel.ColumnParallelLinear(
-            self.hidden_size,
-            self.hidden_size,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            gather_output=False,
-        )
+        # Q, K, V projections with tensor parallelism. When output gating is
+        # enabled, fuse G into the same ColumnParallelLinear so SP chunks do
+        # one larger GEMM instead of q/k/v plus a separate g projection. This
+        # is mathematically equivalent to independent linear projections; the
+        # local output layout is [q_local, k_local, v_local, g_local].
+        if self.use_gate:
+            self.qkvg_proj = tensor_parallel.ColumnParallelLinear(
+                self.hidden_size,
+                4 * self.hidden_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=False,
+                stride=4,
+            )
+        else:
+            self.q_proj = tensor_parallel.ColumnParallelLinear(
+                self.hidden_size,
+                self.hidden_size,  # = num_heads * head_dim
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=False,  # Keep split across TP ranks
+            )
+            self.k_proj = tensor_parallel.ColumnParallelLinear(
+                self.hidden_size,
+                self.hidden_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=False,
+            )
+            self.v_proj = tensor_parallel.ColumnParallelLinear(
+                self.hidden_size,
+                self.hidden_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=False,
+            )
 
         # Beta projection: projects to num_heads_per_partition
         # We use a simple nn.Linear here because beta is small (output = num_heads)
@@ -415,14 +392,6 @@ class DeltaNetAttention(MegatronModule):
 
         # Output normalization
         if self.use_gate:
-            self.g_proj = tensor_parallel.ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                config=config,
-                init_method=config.init_method,
-                bias=False,
-                gather_output=False,
-            )
             # FLA's FusedRMSNormGated for gated output
             from fla.modules import FusedRMSNormGated
             self.o_norm = FusedRMSNormGated(self.head_dim, eps=1e-5)
@@ -634,14 +603,21 @@ class DeltaNetAttention(MegatronModule):
 
         # ============ Projections (keep [s, b, h] for ColumnParallelLinear) ============
         # ColumnParallelLinear: [s(/tp), b, h] -> all-gather dim-0 -> [s, b, h] -> matmul -> [s, b, h/tp]
-        q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
-        k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
-        v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
+        if self.use_gate:
+            qkvg, _ = self.qkvg_proj(hidden_states)
+            q, k, v, g = torch.chunk(qkvg, 4, dim=-1)
+        else:
+            q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
+            k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
+            v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
+            g = None
 
         # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
         q = q.transpose(0, 1).contiguous()
         k = k.transpose(0, 1).contiguous()
         v = v.transpose(0, 1).contiguous()
+        if g is not None:
+            g = g.transpose(0, 1).contiguous()
 
         # Also prepare hidden_states for b_proj (nn.Linear, no internal all-gather).
         # When sequence_parallel=True, hidden_states is [s/tp, b, h], but
@@ -668,8 +644,11 @@ class DeltaNetAttention(MegatronModule):
         # (fp32) diff between SP=1 and SP=1+force-seq-chunks=N proves Seq1F1B's
         # DeltaNet integration is algorithmically correct.
         fsc = getattr(args, 'force_seq_chunks', 1)
-        use_force_chunks = (args.pipe_sp_splits == 1 and fsc > 1
-                            and micro_sp_idx is None)
+        use_force_chunks = (
+            args.pipe_sp_splits == 1
+            and fsc > 1
+            and (micro_sp_idx is None or micro_sp_idx == 0)
+        )
         if use_force_chunks:
             assert seq_len % fsc == 0, (
                 f"seq_len {seq_len} must be divisible by "
@@ -708,10 +687,6 @@ class DeltaNetAttention(MegatronModule):
 
         # ============ Output normalization & gate ============
         if self.use_gate:
-            # g_proj is ColumnParallelLinear, expects [s(/tp), b, h] format
-            # It handles all-gather internally when sequence_parallel=True
-            g, _ = self.g_proj(hidden_states)    # [s, b, h/tp]
-            g = g.transpose(0, 1).contiguous()   # [b, s, h/tp]
             g = rearrange(g, 'b s (h d) -> b s h d', d=self.head_dim)
             o = self.o_norm(o, g)
         else:
