@@ -949,7 +949,7 @@ def get_tensor_shapes(
     global_args = get_args()
     if global_args.pipe_sp_splits != 1 and global_args.pipe_sp_strategy == 'average':
         seq_length = seq_length // global_args.pipe_sp_splits
-    elif global_args.pipe_sp_splits != 1 and global_args.pipe_sp_strategy == "uniform_comp":
+    elif global_args.pipe_sp_splits != 1 and global_args.pipe_sp_strategy in ("uniform_comp", "hybrid_comp"):
         return sp_shape_queue(seq_length, micro_batch_size, config.hidden_size, backward=backward)
     if config.sequence_parallel:
         seq_length = seq_length // parallel_state.get_tensor_model_parallel_world_size()

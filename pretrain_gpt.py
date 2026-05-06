@@ -39,7 +39,7 @@ def get_batch_sp():
         seq_length = tokens.size(1)
         global_args = get_args()
         global_args.pipe_sp_strategy = "average" if global_args.pipe_sp_splits == 1 else global_args.pipe_sp_strategy
-        if global_args.pipe_sp_strategy == "uniform_comp":
+        if global_args.pipe_sp_strategy in ("uniform_comp", "hybrid_comp"):
             l_s = 0
             for idx,split in enumerate(get_splits()):
                 _tokens = tokens[:, l_s:l_s+split]

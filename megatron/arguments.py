@@ -867,7 +867,7 @@ def _add_training_args(parser):
                        'number of micro-batches.')
     group.add_argument('--pipe-sp-splits', type=int, default=1,
                        help='num micro sequence')
-    group.add_argument('--pipe-sp-strategy', type=str, default="average", choices=['average','uniform_comp'],
+    group.add_argument('--pipe-sp-strategy', type=str, default="average", choices=['average','uniform_comp','hybrid_comp'],
                        help='how to split sequence exactly')
     group.add_argument('--rampup-batch-size', nargs='*', default=None,
                        help='Batch size ramp up with the following values:'

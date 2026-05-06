@@ -10,6 +10,10 @@ class SeqTFlops:
     num_heads: int
     dim_head: int
     vocab_size: int
+    softmax_layers: int = None
+
+    def get_quadratic_layers(self):
+        return self.num_layers if self.softmax_layers is None else self.softmax_layers
 
     def get_ffn_tflops(self, seqlen):
         ffn_tflops = 4 * seqlen * self.hidden_size * self.ffn_size
@@ -33,18 +37,29 @@ class SeqTFlops:
         attn_softmax_tflops = 3 * seqlen * seqlen * num_heads + 2 * seqlen * seqlen * num_heads * dim_head
         attn_softmax_tflops *= scale
         attn_o_proj_tflops = 2 * seqlen * hidden_size * (dim_head * num_heads)
-        attn_total = attn_proj_tflops + attn_qk_tflops + attn_softmax_tflops + attn_o_proj_tflops
-        total = embed_tflops + config.num_layers * (attn_total + ffn_tflops) + embed_proj_tflops
+        attn_linear = attn_proj_tflops + attn_o_proj_tflops
+        attn_quadratic = attn_qk_tflops + attn_softmax_tflops
+        total = (
+            embed_tflops
+            + config.num_layers * (attn_linear + ffn_tflops)
+            + config.get_quadratic_layers() * attn_quadratic
+            + embed_proj_tflops
+        )
         return total / 10 ** 12
 
     def get_prefix_tflops(self, seqlen, prefix):
-        attn_part = seqlen * prefix * (self.dim_head * 4 + 3 ) \
-            * self.num_heads + seqlen * 8 * self.hidden_size \
-            * self.num_heads * self.dim_head - seqlen ** 2 * (4 * self.dim_head + 3) \
+        attn_quadratic = seqlen * prefix * (self.dim_head * 4 + 3) \
+            * self.num_heads - seqlen ** 2 * (4 * self.dim_head + 3) \
             * self.num_heads / 2
+        attn_linear = seqlen * 8 * self.hidden_size * self.num_heads * self.dim_head
         ffn_tflops = self.get_ffn_tflops(seqlen)
         embed_tflops,emb_proj_tflops = self.get_emb_tflops(seqlen)
-        tf = embed_tflops + self.num_layers * (attn_part + ffn_tflops) + emb_proj_tflops
+        tf = (
+            embed_tflops
+            + self.num_layers * (attn_linear + ffn_tflops)
+            + self.get_quadratic_layers() * attn_quadratic
+            + emb_proj_tflops
+        )
         return tf / 10 ** 12
 
 class sp_queue:
@@ -101,6 +116,38 @@ class sp_queue:
         
 
 partitions = None
+
+def _parse_layer_selection(spec):
+    layers = set()
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '-' in item:
+            start_s, end_s = item.split('-', 1)
+            layers.update(range(int(start_s), int(end_s) + 1))
+        else:
+            layers.add(int(item))
+    return layers
+
+def _count_hybrid_softmax_layers(args):
+    if not getattr(args, 'use_deltanet', False):
+        return args.num_layers
+
+    layers = set()
+    explicit_layers = getattr(args, 'deltanet_hybrid_attention_layers', '')
+    if explicit_layers.strip():
+        layers.update(_parse_layer_selection(explicit_layers))
+
+    period = getattr(args, 'deltanet_hybrid_attention_period', 0)
+    if period > 0:
+        offset = getattr(args, 'deltanet_hybrid_attention_offset', 0)
+        for layer in range(1, args.num_layers + 1):
+            if (layer - offset) % period == 0:
+                layers.add(layer)
+
+    return len([layer for layer in layers if 1 <= layer <= args.num_layers])
+
 def get_tflops():
     args = get_args()
     config = {
@@ -134,6 +181,8 @@ def get_splits():
             "dim_head": args.hidden_size // args.num_attention_heads,
             "vocab_size": args.padded_vocab_size
         }
+        if args.pipe_sp_strategy == "hybrid_comp":
+            config["softmax_layers"] = _count_hybrid_softmax_layers(args)
         tflops_config = SeqTFlops(**config)
         sol = solver(seqlen, tflops_config)
         if args.sequence_parallel:

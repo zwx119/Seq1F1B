@@ -837,7 +837,7 @@ class ParallelAttention(MegatronModule):
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
             if args.pipe_sp_splits != 1:
-                if args.pipe_sp_strategy == "uniform_comp":
+                if args.pipe_sp_strategy in ("uniform_comp", "hybrid_comp"):
                     splits = get_splits()
                     start = sum(splits[:micro_sp_idx])
                     end = sum(splits[:micro_sp_idx+1])
