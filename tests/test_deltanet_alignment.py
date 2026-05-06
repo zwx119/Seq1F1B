@@ -284,17 +284,28 @@ def get_batch_sp_func_factory():
 
     def get_data(*args, **kwargs):
         nonlocal global_data, offset
-        pipe_sp = get_args().pipe_sp_splits
+        parsed_args = get_args()
+        pipe_sp = parsed_args.pipe_sp_splits
         if offset == -1 or offset + 1 == pipe_sp:
             global_data = get_batch(*args, **kwargs)
         offset = (offset + 1) % pipe_sp
         tokens, labels, loss_mask, attention_mask, position_ids = global_data
         seq_length = tokens.size(1)
-        tokens = tokens.chunk(pipe_sp, dim=1)[offset]
-        labels = labels.chunk(pipe_sp, dim=1)[offset]
-        loss_mask._start = seq_length // pipe_sp * offset
-        loss_mask._end = seq_length // pipe_sp * (offset + 1)
-        position_ids = position_ids.chunk(pipe_sp, dim=1)[offset]
+        if pipe_sp > 1 and parsed_args.pipe_sp_strategy in ("uniform_comp", "hybrid_comp"):
+            splits = get_splits()
+            start = sum(splits[:offset])
+            end = start + splits[offset]
+            tokens = tokens[:, start:end]
+            labels = labels[:, start:end]
+            position_ids = position_ids[:, start:end]
+            loss_mask._start = start
+            loss_mask._end = end
+        else:
+            tokens = tokens.chunk(pipe_sp, dim=1)[offset]
+            labels = labels.chunk(pipe_sp, dim=1)[offset]
+            loss_mask._start = seq_length // pipe_sp * offset
+            loss_mask._end = seq_length // pipe_sp * (offset + 1)
+            position_ids = position_ids.chunk(pipe_sp, dim=1)[offset]
         return tokens, labels, loss_mask, attention_mask, position_ids, offset
 
     return get_data
