@@ -8,7 +8,7 @@
 #   MODE=all bash tests/run_h100_cc_tc_experiment.sh
 #
 # Nsight Systems with NVTX ranges, without correctness/reference pollution:
-#   PROFILE=nsys SKIP_CORRECTNESS=1 MODE=hopper bash tests/run_h100_cc_tc_experiment.sh
+#   PROFILE=nsys SKIP_CORRECTNESS=1 MODE=overlap bash tests/run_h100_cc_tc_experiment.sh
 #
 # Nsight Compute for the fused kernel:
 #   PROFILE=ncu MODE=fused bash tests/run_h100_cc_tc_experiment.sh
@@ -26,7 +26,7 @@ mkdir -p "${OUT_DIR}"
 
 export PYTHONPATH="${FLA_DIR}:${DIR}:${PYTHONPATH:-}"
 
-MODE=${MODE:-original}      # original, fused, hopper, both, all
+MODE=${MODE:-original}      # original, fused, hopper, overlap, both, all
 PROFILE=${PROFILE:-none}    # none, nsys, ncu
 
 B=${B:-1}
@@ -114,13 +114,15 @@ case "${PROFILE}" in
       exit 1
     fi
     if [ "${MODE}" = "both" ] || [ "${MODE}" = "all" ]; then
-      echo "ERROR: use MODE=original, MODE=fused, or MODE=hopper with PROFILE=ncu to keep reports clean" >&2
+      echo "ERROR: use MODE=original, MODE=fused, MODE=hopper, or MODE=overlap with PROFILE=ncu to keep reports clean" >&2
       exit 1
     fi
     if [ "${MODE}" = "fused" ]; then
       KERNEL_REGEX="regex:.*fused_solve_wu_fwd_kernel.*"
     elif [ "${MODE}" = "hopper" ]; then
       KERNEL_REGEX="regex:.*hopper_solve_tril_64x64_kernel.*"
+    elif [ "${MODE}" = "overlap" ]; then
+      KERNEL_REGEX="regex:.*overlap_solve_tril_64x64_kernel.*"
     else
       KERNEL_REGEX="regex:.*(solve_tril|recompute_w_u_fwd_kernel).*"
     fi
