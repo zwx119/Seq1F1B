@@ -46,7 +46,7 @@ FLA_DIR="${FLA_DIR:-${DIR}/flash-linear-attention}"
 if [ -d "${FLA_DIR}/fla" ]; then
     export PYTHONPATH="${FLA_DIR}:${PYTHONPATH:-}"
 fi
-export FLA_USE_FUSED_SOLVE_WU="${FLA_USE_FUSED_SOLVE_WU:-1}"
+export FLA_USE_FUSED_SOLVE_WU="${FLA_USE_FUSED_SOLVE_WU:-0}"
 
 mkdir -p "${OUT_ROOT}"
 
