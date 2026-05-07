@@ -93,6 +93,7 @@ EVAL_ITERS=${EVAL_ITERS:-20}
 SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
 NO_SAVE=${NO_SAVE:-0}
 EXTRA_ARGS=${EXTRA_ARGS:-}
+PIPE_SP_STRATEGY=${PIPE_SP_STRATEGY:-average}
 
 # --- distributed ---
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
@@ -121,6 +122,7 @@ fi
 # CUDA_DEVICE_MAX_CONNECTIONS=1 is the Megatron-recommended deterministic
 # setting (overrideable).
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+export FLA_USE_FUSED_SOLVE_WU="${FLA_USE_FUSED_SOLVE_WU:-0}"
 
 # ============================================================================
 # Sanity checks
@@ -168,6 +170,8 @@ fi
 echo "  OUT_DIR      = ${OUT_DIR}"
 echo "  ONLY         = ${ONLY}"
 echo "  seq1f1b_sp   = ${SEQ1F1B_SP}"
+echo "  pipe_sp_str  = ${PIPE_SP_STRATEGY}"
+echo "  fused_solve  = ${FLA_USE_FUSED_SOLVE_WU}"
 echo "  resume       = ${RESUME}"
 echo "  torchrun     = $([ "${TORCHRUN_STANDALONE}" = "1" ] && echo standalone || echo c10d)"
 if [ -n "${EXTRA_ARGS}" ]; then
@@ -229,7 +233,7 @@ run_one() {
     local options=" \
         --tensor-model-parallel-size ${TP_SIZE} \
         --pipeline-model-parallel-size ${PP_SIZE} \
-        --pipe-sp-strategy average \
+        --pipe-sp-strategy ${PIPE_SP_STRATEGY} \
         --pipe-sp-splits ${PP_SP} \
         --num-layers ${NUM_LAYERS} \
         --hidden-size ${HIDDEN} \

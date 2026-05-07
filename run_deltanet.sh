@@ -13,6 +13,7 @@ set -euo pipefail
 MAX_RESTARTS=0
 export NCCL_IB_QPS_PER_CONNECTION=8
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export FLA_USE_FUSED_SOLVE_WU="${FLA_USE_FUSED_SOLVE_WU:-0}"
 
 DISTRIBUTED_ARGS="--nproc_per_node ${GPUS_PER_NODE:-8} \
                    --nnodes ${WORLD_SIZE:-1} \
@@ -122,6 +123,7 @@ fi
 
 run_cmd="torchrun ${DISTRIBUTED_ARGS} ${DIR}/pretrain_gpt.py ${options}"
 echo "====== DeltaNet Seq1F1B Launch Command ======"
+echo "FLA_USE_FUSED_SOLVE_WU=${FLA_USE_FUSED_SOLVE_WU}"
 echo "${run_cmd}"
 echo "============================================="
 exec ${run_cmd}
