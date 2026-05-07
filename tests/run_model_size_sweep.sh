@@ -46,7 +46,10 @@ FLA_DIR="${FLA_DIR:-${DIR}/flash-linear-attention}"
 if [ -d "${FLA_DIR}/fla" ]; then
     export PYTHONPATH="${FLA_DIR}:${PYTHONPATH:-}"
 fi
-export FLA_USE_FUSED_SOLVE_WU="${FLA_USE_FUSED_SOLVE_WU:-1}"
+# Fused/Hopper solve_wu variants are experimental and were slower than the
+# original FLA path on H100. Keep sweeps on the safe original path unless the
+# caller explicitly opts into a kernel experiment.
+export FLA_USE_FUSED_SOLVE_WU="${FLA_USE_FUSED_SOLVE_WU:-0}"
 
 mkdir -p "${OUT_ROOT}"
 

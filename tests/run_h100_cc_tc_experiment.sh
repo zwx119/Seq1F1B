@@ -4,8 +4,11 @@
 # Default:
 #   bash tests/run_h100_cc_tc_experiment.sh
 #
-# Nsight Systems with NVTX ranges:
-#   PROFILE=nsys bash tests/run_h100_cc_tc_experiment.sh
+# Compare all implementations:
+#   MODE=all bash tests/run_h100_cc_tc_experiment.sh
+#
+# Nsight Systems with NVTX ranges, without correctness/reference pollution:
+#   PROFILE=nsys SKIP_CORRECTNESS=1 MODE=hopper bash tests/run_h100_cc_tc_experiment.sh
 #
 # Nsight Compute for the fused kernel:
 #   PROFILE=ncu MODE=fused bash tests/run_h100_cc_tc_experiment.sh
@@ -23,7 +26,7 @@ mkdir -p "${OUT_DIR}"
 
 export PYTHONPATH="${FLA_DIR}:${DIR}:${PYTHONPATH:-}"
 
-MODE=${MODE:-all}           # original, fused, hopper, both, all
+MODE=${MODE:-original}      # original, fused, hopper, both, all
 PROFILE=${PROFILE:-none}    # none, nsys, ncu
 
 B=${B:-1}
@@ -37,6 +40,7 @@ N_ITER=${N_ITER:-50}
 REPEATS=${REPEATS:-3}
 NORMALIZE_K=${NORMALIZE_K:-1}
 BETA_SCALE=${BETA_SCALE:-0.1}
+SKIP_CORRECTNESS=${SKIP_CORRECTNESS:-0}
 
 BENCH="${FLA_DIR}/tests/bench_h100_cc_tc_solve_wu.py"
 
@@ -73,6 +77,19 @@ echo "  OUT_DIR=${OUT_DIR}"
 echo "  mode=${MODE} profile=${PROFILE}"
 echo "  shape=B${B}_T${T}_H${H}_K${K}_V${V}_${DTYPE}"
 echo "  normalize_k=${NORMALIZE_K} beta_scale=${BETA_SCALE}"
+echo "  skip_correctness=${SKIP_CORRECTNESS}"
+
+case "${SKIP_CORRECTNESS}" in
+  1|true|TRUE|yes|YES|on|ON)
+    COMMON_ARGS+=(--skip-correctness)
+    ;;
+  0|false|FALSE|no|NO|off|OFF)
+    ;;
+  *)
+    echo "ERROR: SKIP_CORRECTNESS must be 0/1, true/false, yes/no, or on/off; got ${SKIP_CORRECTNESS}" >&2
+    exit 1
+    ;;
+esac
 
 case "${PROFILE}" in
   none)
