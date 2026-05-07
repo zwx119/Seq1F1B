@@ -23,7 +23,7 @@ mkdir -p "${OUT_DIR}"
 
 export PYTHONPATH="${FLA_DIR}:${DIR}:${PYTHONPATH:-}"
 
-MODE=${MODE:-both}          # original, fused, both
+MODE=${MODE:-all}           # original, fused, hopper, both, all
 PROFILE=${PROFILE:-none}    # none, nsys, ncu
 
 B=${B:-1}
@@ -96,12 +96,14 @@ case "${PROFILE}" in
       echo "ERROR: ncu not found in PATH" >&2
       exit 1
     fi
-    if [ "${MODE}" = "both" ]; then
-      echo "ERROR: use MODE=original or MODE=fused with PROFILE=ncu to keep reports clean" >&2
+    if [ "${MODE}" = "both" ] || [ "${MODE}" = "all" ]; then
+      echo "ERROR: use MODE=original, MODE=fused, or MODE=hopper with PROFILE=ncu to keep reports clean" >&2
       exit 1
     fi
     if [ "${MODE}" = "fused" ]; then
       KERNEL_REGEX="regex:.*fused_solve_wu_fwd_kernel.*"
+    elif [ "${MODE}" = "hopper" ]; then
+      KERNEL_REGEX="regex:.*hopper_solve_tril_64x64_kernel.*"
     else
       KERNEL_REGEX="regex:.*(solve_tril|recompute_w_u_fwd_kernel).*"
     fi
