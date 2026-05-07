@@ -12,6 +12,7 @@
 #
 # Useful overrides:
 #   T=16384 N_ITER=100 REPEATS=5 DTYPE=bf16 bash tests/run_h100_cc_tc_experiment.sh
+#   NORMALIZE_K=0 bash tests/run_h100_cc_tc_experiment.sh  # old raw-K stress input
 
 set -euo pipefail
 
@@ -28,12 +29,14 @@ PROFILE=${PROFILE:-none}    # none, nsys, ncu
 B=${B:-1}
 T=${T:-8192}
 H=${H:-32}
-K=${K:-128}
-V=${V:-128}
+K=${K:-80}
+V=${V:-80}
 DTYPE=${DTYPE:-bf16}
 WARMUP=${WARMUP:-10}
 N_ITER=${N_ITER:-50}
 REPEATS=${REPEATS:-3}
+NORMALIZE_K=${NORMALIZE_K:-1}
+BETA_SCALE=${BETA_SCALE:-0.1}
 
 BENCH="${FLA_DIR}/tests/bench_h100_cc_tc_solve_wu.py"
 
@@ -48,13 +51,28 @@ COMMON_ARGS=(
   --warmup "${WARMUP}"
   --n-iter "${N_ITER}"
   --repeats "${REPEATS}"
+  --beta-scale "${BETA_SCALE}"
 )
+
+case "${NORMALIZE_K}" in
+  1|true|TRUE|yes|YES|on|ON)
+    COMMON_ARGS+=(--normalize-k)
+    ;;
+  0|false|FALSE|no|NO|off|OFF)
+    COMMON_ARGS+=(--no-normalize-k)
+    ;;
+  *)
+    echo "ERROR: NORMALIZE_K must be 0/1, true/false, yes/no, or on/off; got ${NORMALIZE_K}" >&2
+    exit 1
+    ;;
+esac
 
 echo "H100 CC/TC solve_wu experiment"
 echo "  FLA_DIR=${FLA_DIR}"
 echo "  OUT_DIR=${OUT_DIR}"
 echo "  mode=${MODE} profile=${PROFILE}"
 echo "  shape=B${B}_T${T}_H${H}_K${K}_V${V}_${DTYPE}"
+echo "  normalize_k=${NORMALIZE_K} beta_scale=${BETA_SCALE}"
 
 case "${PROFILE}" in
   none)
