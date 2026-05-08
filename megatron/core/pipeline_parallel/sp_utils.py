@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from megatron.core.pipeline_parallel.split_solver import solver
 from megatron import get_args
 import torch
@@ -11,6 +12,13 @@ class SeqTFlops:
     dim_head: int
     vocab_size: int
     softmax_layers: int = None
+    deltanet_layers: int = 0
+    deltanet_head_dim: int = None
+    deltanet_chunk_size: int = 64
+    deltanet_conv_size: int = 4
+    deltanet_use_beta: bool = True
+    deltanet_use_short_conv: bool = True
+    deltanet_use_output_gate: bool = False
 
     def get_quadratic_layers(self):
         return self.num_layers if self.softmax_layers is None else self.softmax_layers
@@ -18,6 +26,48 @@ class SeqTFlops:
     def get_ffn_tflops(self, seqlen):
         ffn_tflops = 4 * seqlen * self.hidden_size * self.ffn_size
         return ffn_tflops
+
+    def get_deltanet_core_tflops(self, seqlen):
+        """Approximate per-DeltaNet-layer linear recurrent-core FLOPs.
+
+        The shared q/k/v/o projections and MLP are counted in the common linear
+        terms. This term accounts for DeltaNet-specific work that is linear in
+        sequence length: KKT/WY preparation, state passing/output, short conv,
+        beta projection, and the optional output gate projection.
+        """
+        if self.deltanet_layers <= 0:
+            return 0
+
+        head_dim = self.deltanet_head_dim or self.dim_head
+        key_dim = head_dim
+        value_dim = head_dim
+        block = self.deltanet_chunk_size
+
+        # K @ K^T over 64-token DeltaNet blocks.
+        kkt = 2 * seqlen * block * self.num_heads * key_dim
+        # Triangular solve/recompute applications to K and V representations.
+        wy = 2 * seqlen * block * self.num_heads * (key_dim + value_dim)
+        # State update plus output contraction, both linear in sequence length.
+        state_and_output = 4 * seqlen * self.num_heads * key_dim * value_dim
+
+        short_conv = 0
+        if self.deltanet_use_short_conv:
+            short_conv = (
+                2 * seqlen * self.deltanet_conv_size * self.num_heads
+                * (2 * key_dim + value_dim)
+            )
+
+        beta = 0
+        if self.deltanet_use_beta:
+            beta = 2 * seqlen * self.hidden_size * self.num_heads
+
+        gate = 0
+        if self.deltanet_use_output_gate:
+            # The common projection term counts q/k/v/o. Output gating adds one
+            # extra hidden->hidden projection for g.
+            gate = 2 * seqlen * self.hidden_size * self.hidden_size
+
+        return kkt + wy + state_and_output + short_conv + beta + gate
 
     def get_emb_tflops(self, seqlen):
         embed_tflops = 2 * seqlen * self.hidden_size * self.vocab_size
@@ -43,6 +93,7 @@ class SeqTFlops:
             embed_tflops
             + config.num_layers * (attn_linear + ffn_tflops)
             + config.get_quadratic_layers() * attn_quadratic
+            + config.deltanet_layers * config.get_deltanet_core_tflops(seqlen)
             + embed_proj_tflops
         )
         return total / 10 ** 12
@@ -58,6 +109,7 @@ class SeqTFlops:
             embed_tflops
             + self.num_layers * (attn_linear + ffn_tflops)
             + self.get_quadratic_layers() * attn_quadratic
+            + self.deltanet_layers * self.get_deltanet_core_tflops(seqlen)
             + emb_proj_tflops
         )
         return tf / 10 ** 12
@@ -148,6 +200,36 @@ def _count_hybrid_softmax_layers(args):
 
     return len([layer for layer in layers if 1 <= layer <= args.num_layers])
 
+def _split_alignment(args):
+    align = 128
+    if args.sequence_parallel:
+        tp = args.tensor_model_parallel_size
+        align = abs(align * tp) // math.gcd(align, tp)
+    if args.seq_length % align != 0:
+        # Keep legacy behavior for unusual sequence lengths that cannot be
+        # partitioned into fully aligned chunks.
+        return args.tensor_model_parallel_size if args.sequence_parallel else 1
+    return align
+
+def _add_deltanet_cost_config(config, args, softmax_layers):
+    if not getattr(args, 'use_deltanet', False):
+        return
+
+    deltanet_layers = args.num_layers - softmax_layers
+    config.update({
+        "deltanet_layers": max(deltanet_layers, 0),
+        "deltanet_head_dim": (
+            args.deltanet_head_dim
+            if getattr(args, 'deltanet_head_dim', None) is not None
+            else args.hidden_size // args.num_attention_heads
+        ),
+        "deltanet_chunk_size": 64,
+        "deltanet_conv_size": getattr(args, 'deltanet_conv_size', 4),
+        "deltanet_use_beta": getattr(args, 'deltanet_use_beta', True),
+        "deltanet_use_short_conv": getattr(args, 'deltanet_use_short_conv', True),
+        "deltanet_use_output_gate": getattr(args, 'deltanet_use_output_gate', False),
+    })
+
 def get_tflops():
     args = get_args()
     config = {
@@ -182,13 +264,12 @@ def get_splits():
             "vocab_size": args.padded_vocab_size
         }
         if args.pipe_sp_strategy == "hybrid_comp":
-            config["softmax_layers"] = _count_hybrid_softmax_layers(args)
+            softmax_layers = _count_hybrid_softmax_layers(args)
+            config["softmax_layers"] = softmax_layers
+            _add_deltanet_cost_config(config, args, softmax_layers)
         tflops_config = SeqTFlops(**config)
         sol = solver(seqlen, tflops_config)
-        if args.sequence_parallel:
-            mod = args.tensor_model_parallel_size
-        else:
-            mod = 1
+        mod = _split_alignment(args)
         partitions = sol.solve_partition(args.pipe_sp_splits, mod)
         return partitions
     else:

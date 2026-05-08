@@ -9,7 +9,6 @@ quick audit tool for `--pipe-sp-strategy hybrid_comp`.
 from __future__ import annotations
 
 import argparse
-import math
 from dataclasses import dataclass
 
 
@@ -22,12 +21,52 @@ class SeqTFlops:
     dim_head: int
     vocab_size: int
     softmax_layers: int | None = None
+    deltanet_layers: int = 0
+    deltanet_head_dim: int | None = None
+    deltanet_chunk_size: int = 64
+    deltanet_conv_size: int = 4
+    deltanet_use_beta: bool = True
+    deltanet_use_short_conv: bool = True
+    deltanet_use_output_gate: bool = False
 
     def get_quadratic_layers(self) -> int:
         return self.num_layers if self.softmax_layers is None else self.softmax_layers
 
     def get_ffn_tflops(self, seqlen: int) -> float:
         return 4 * seqlen * self.hidden_size * self.ffn_size
+
+    def get_deltanet_core_tflops(self, seqlen: int) -> float:
+        if self.deltanet_layers <= 0:
+            return 0.0
+
+        head_dim = self.deltanet_head_dim or self.dim_head
+        key_dim = head_dim
+        value_dim = head_dim
+        block = self.deltanet_chunk_size
+
+        kkt = 2 * seqlen * block * self.num_heads * key_dim
+        wy = 2 * seqlen * block * self.num_heads * (key_dim + value_dim)
+        state_and_output = 4 * seqlen * self.num_heads * key_dim * value_dim
+
+        short_conv = 0
+        if self.deltanet_use_short_conv:
+            short_conv = (
+                2 * seqlen * self.deltanet_conv_size * self.num_heads
+                * (2 * key_dim + value_dim)
+            )
+
+        beta = 0
+        if self.deltanet_use_beta:
+            beta = 2 * seqlen * self.hidden_size * self.num_heads
+
+        gate = 0
+        if self.deltanet_use_output_gate:
+            gate = 2 * seqlen * self.hidden_size * self.hidden_size
+
+        return kkt + wy + state_and_output + short_conv + beta + gate
+
+    def get_deltanet_core_tflops_per_token(self) -> float:
+        return self.get_deltanet_core_tflops(1)
 
     def get_emb_tflops(self, seqlen: int) -> tuple[float, float]:
         embed_tflops = 2 * seqlen * self.hidden_size * self.vocab_size
@@ -51,6 +90,7 @@ class SeqTFlops:
             embed_tflops
             + self.num_layers * (attn_linear + ffn_tflops)
             + self.get_quadratic_layers() * attn_quadratic
+            + self.deltanet_layers * self.get_deltanet_core_tflops(seqlen)
             + embed_proj_tflops
         )
         return total / 1e12
@@ -67,6 +107,7 @@ class SeqTFlops:
             embed_tflops
             + self.num_layers * (attn_linear + ffn_tflops)
             + self.get_quadratic_layers() * attn_quadratic
+            + self.deltanet_layers * self.get_deltanet_core_tflops(seqlen)
             + embed_proj_tflops
         )
         return tf / 1e12
@@ -77,45 +118,48 @@ def round_down(x: int, mod: int) -> int:
 
 
 def solve_partition(total_seqlen: int, num_splits: int, config: SeqTFlops, mod: int) -> list[int]:
-    """Solve the same monotonic quadratic used by split_solver.py.
-
-    The original code uses sympy. Here we use the closed-form root so this tool
-    works even in minimal environments.
-    """
+    """Solve the same aligned imbalance minimization used by split_solver.py."""
     total = config.get_seq_tflops(total_seqlen, causal=True)
     target = total / num_splits
-    res: list[int] = []
-    prefix = total_seqlen
+    if mod <= 1 or total_seqlen % mod != 0:
+        raise ValueError("--mod must divide every inspected sequence length")
 
-    linear_per_token = (
-        4 * config.hidden_size * config.vocab_size
-        + config.num_layers * (
-            8 * config.hidden_size * config.num_heads * config.dim_head
-            + 4 * config.hidden_size * config.ffn_size
+    units = total_seqlen // mod
+    if units < num_splits:
+        raise ValueError(
+            f"Cannot split sequence length {total_seqlen} into {num_splits} "
+            f"positive chunks aligned to {mod}."
         )
-    ) / 1e12
-    quad_coeff = config.get_quadratic_layers() * (4 * config.dim_head + 3) * config.num_heads / 1e12
 
-    for _ in range(1, num_splits):
-        # cost(x, prefix) = linear*x + quad*(prefix*x - x^2/2) = target
-        # 0.5*quad*x^2 - (linear + quad*prefix)*x + target = 0
-        a = 0.5 * quad_coeff
-        b = -(linear_per_token + quad_coeff * prefix)
-        c = target
-        if abs(a) < 1e-30:
-            root = c / -b
-        else:
-            disc = max(b * b - 4 * a * c, 0.0)
-            r1 = (-b - math.sqrt(disc)) / (2 * a)
-            r2 = (-b + math.sqrt(disc)) / (2 * a)
-            candidates = [r for r in (r1, r2) if 0 <= r <= prefix]
-            root = min(candidates) if candidates else min(r1, r2)
-        part = round_down(int(root), mod)
-        res.insert(0, part)
-        prefix -= part
+    inf = float("inf")
+    dp = [[inf] * (units + 1) for _ in range(num_splits + 1)]
+    prev = [[-1] * (units + 1) for _ in range(num_splits + 1)]
+    dp[0][0] = 0.0
 
-    res.insert(0, prefix)
-    return res
+    for k in range(1, num_splits + 1):
+        min_end = k
+        max_end = units - (num_splits - k)
+        for end in range(min_end, max_end + 1):
+            for start in range(k - 1, end):
+                if dp[k - 1][start] == inf:
+                    continue
+                length = (end - start) * mod
+                prefix = end * mod
+                cost = config.get_prefix_tflops(length, prefix)
+                score = max(dp[k - 1][start], abs(cost - target))
+                if score < dp[k][end]:
+                    dp[k][end] = score
+                    prev[k][end] = start
+
+    splits: list[int] = []
+    end = units
+    for k in range(num_splits, 0, -1):
+        start = prev[k][end]
+        if start < 0:
+            raise RuntimeError("Failed to solve aligned sequence partition.")
+        splits.insert(0, (end - start) * mod)
+        end = start
+    return splits
 
 
 def parse_layers(spec: str) -> set[int]:
@@ -166,11 +210,19 @@ def main() -> None:
     parser.add_argument("--num-heads", type=int, default=32)
     parser.add_argument("--ffn-hidden-size", type=int, default=None)
     parser.add_argument("--vocab-size", type=int, default=50304)
-    parser.add_argument("--mod", type=int, default=1, help="Round split lengths down to a multiple of this value")
+    parser.add_argument("--deltanet-head-dim", type=int, default=None)
+    parser.add_argument("--deltanet-chunk-size", type=int, default=64)
+    parser.add_argument("--deltanet-conv-size", type=int, default=4)
+    parser.add_argument("--no-deltanet-core", action="store_true")
+    parser.add_argument("--no-deltanet-beta", action="store_true")
+    parser.add_argument("--no-deltanet-short-conv", action="store_true")
+    parser.add_argument("--no-deltanet-output-gate", action="store_true")
+    parser.add_argument("--mod", type=int, default=128, help="Round split lengths down to a multiple of this value")
     args = parser.parse_args()
 
     ffn_hidden_size = args.ffn_hidden_size or 4 * args.hidden_size
     softmax_layers = softmax_layer_count(args)
+    deltanet_layers = 0 if args.no_deltanet_core else args.num_layers - (softmax_layers or args.num_layers)
     config = SeqTFlops(
         num_layers=args.num_layers,
         hidden_size=args.hidden_size,
@@ -179,12 +231,21 @@ def main() -> None:
         dim_head=args.hidden_size // args.num_heads,
         vocab_size=args.vocab_size,
         softmax_layers=softmax_layers,
+        deltanet_layers=max(deltanet_layers, 0),
+        deltanet_head_dim=args.deltanet_head_dim or args.hidden_size // args.num_heads,
+        deltanet_chunk_size=args.deltanet_chunk_size,
+        deltanet_conv_size=args.deltanet_conv_size,
+        deltanet_use_beta=not args.no_deltanet_beta,
+        deltanet_use_short_conv=not args.no_deltanet_short_conv,
+        deltanet_use_output_gate=not args.no_deltanet_output_gate,
     )
 
     print("Seq1F1B split formula audit")
     print(f"  pattern={args.pattern} softmax_layers={config.get_quadratic_layers()} / {args.num_layers}")
+    print(f"  deltanet_layers={config.deltanet_layers} include_core={not args.no_deltanet_core}")
     print(f"  model=L{args.num_layers} H{args.hidden_size} heads={args.num_heads} ffn={ffn_hidden_size}")
-    print("  note=cost model balances linear all-layer FLOPs plus causal quadratic softmax-layer FLOPs")
+    print(f"  align={args.mod}")
+    print("  note=cost model balances common linear FLOPs, DeltaNet linear core, and causal quadratic softmax FLOPs")
 
     for seq in [int(x) for x in args.seq_list.split(",") if x.strip()]:
         for sp in [int(x) for x in args.sp_list.split(",") if x.strip()]:
