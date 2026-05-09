@@ -94,6 +94,7 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
 NO_SAVE=${NO_SAVE:-0}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 PIPE_SP_STRATEGY=${PIPE_SP_STRATEGY:-average}
+PIPE_SP_MANUAL_SPLITS=${PIPE_SP_MANUAL_SPLITS:-}
 
 # --- distributed ---
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
@@ -171,6 +172,9 @@ echo "  OUT_DIR      = ${OUT_DIR}"
 echo "  ONLY         = ${ONLY}"
 echo "  seq1f1b_sp   = ${SEQ1F1B_SP}"
 echo "  pipe_sp_str  = ${PIPE_SP_STRATEGY}"
+if [ -n "${PIPE_SP_MANUAL_SPLITS}" ]; then
+    echo "  manual_split = ${PIPE_SP_MANUAL_SPLITS}"
+fi
 echo "  fused_solve  = ${FLA_USE_FUSED_SOLVE_WU}"
 echo "  resume       = ${RESUME}"
 echo "  torchrun     = $([ "${TORCHRUN_STANDALONE}" = "1" ] && echo standalone || echo c10d)"
@@ -212,6 +216,14 @@ run_one() {
     if [ "${NO_SAVE}" != "1" ]; then
         SAVE_ARGS="--save-interval ${SAVE_INTERVAL} --save ${CKPT_DIR}"
     fi
+    local PIPE_SP_MANUAL_ARGS=""
+    if [ "${PIPE_SP_STRATEGY}" = "manual" ]; then
+        if [ -z "${PIPE_SP_MANUAL_SPLITS}" ]; then
+            echo "ERROR: PIPE_SP_MANUAL_SPLITS must be set when PIPE_SP_STRATEGY=manual"
+            exit 1
+        fi
+        PIPE_SP_MANUAL_ARGS="--pipe-sp-manual-splits ${PIPE_SP_MANUAL_SPLITS}"
+    fi
 
     local DISTRIBUTED_ARGS
     local LAUNCH_DESC
@@ -234,6 +246,7 @@ run_one() {
         --tensor-model-parallel-size ${TP_SIZE} \
         --pipeline-model-parallel-size ${PP_SIZE} \
         --pipe-sp-strategy ${PIPE_SP_STRATEGY} \
+        ${PIPE_SP_MANUAL_ARGS} \
         --pipe-sp-splits ${PP_SP} \
         --num-layers ${NUM_LAYERS} \
         --hidden-size ${HIDDEN} \

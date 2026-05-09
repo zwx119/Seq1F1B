@@ -148,6 +148,30 @@ def _count_hybrid_softmax_layers(args):
 
     return len([layer for layer in layers if 1 <= layer <= args.num_layers])
 
+def _parse_manual_splits(args):
+    spec = getattr(args, 'pipe_sp_manual_splits', '')
+    if not spec.strip():
+        raise ValueError(
+            '--pipe-sp-strategy=manual requires --pipe-sp-manual-splits, '
+            'for example --pipe-sp-manual-splits 8320,8192,8192,8064.'
+        )
+    splits = [int(item.strip()) for item in spec.split(',') if item.strip()]
+    if len(splits) != args.pipe_sp_splits:
+        raise ValueError(
+            f'Expected {args.pipe_sp_splits} manual splits, got '
+            f'{len(splits)}: {splits}'
+        )
+    if any(split <= 0 for split in splits):
+        raise ValueError(f'Manual splits must be positive: {splits}')
+    if sum(splits) != args.seq_length:
+        raise ValueError(
+            f'Manual splits must sum to seq_length={args.seq_length}, '
+            f'got sum={sum(splits)}: {splits}'
+        )
+    if args.seq_length % 128 == 0 and any(split % 128 != 0 for split in splits):
+        raise ValueError(f'Manual splits must be multiples of 128: {splits}')
+    return splits
+
 def get_tflops():
     args = get_args()
     config = {
@@ -168,6 +192,8 @@ def get_splits():
     args = get_args()
     if args.pipe_sp_strategy == "average":
         return [args.seq_length // args.pipe_sp_splits] * args.pipe_sp_splits
+    if args.pipe_sp_strategy == "manual":
+        return _parse_manual_splits(args)
     if args.pipe_sp_splits == 1:
         return [args.seq_length]
     if partitions is None:

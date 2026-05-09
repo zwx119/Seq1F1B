@@ -867,8 +867,11 @@ def _add_training_args(parser):
                        'number of micro-batches.')
     group.add_argument('--pipe-sp-splits', type=int, default=1,
                        help='num micro sequence')
-    group.add_argument('--pipe-sp-strategy', type=str, default="average", choices=['average','uniform_comp','hybrid_comp'],
+    group.add_argument('--pipe-sp-strategy', type=str, default="average", choices=['average','uniform_comp','hybrid_comp','manual'],
                        help='how to split sequence exactly')
+    group.add_argument('--pipe-sp-manual-splits', type=str, default='',
+                       help='Comma-separated sequence split lengths used when '
+                       '--pipe-sp-strategy=manual, e.g. 8320,8192,8192,8064.')
     group.add_argument('--rampup-batch-size', nargs='*', default=None,
                        help='Batch size ramp up with the following values:'
                        '  --rampup-batch-size <start batch size> '
