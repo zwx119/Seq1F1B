@@ -97,6 +97,25 @@ manual_splits() {
         esac
         return 0
     fi
+    if [ "${seq}" = "65536" ] && [ "${sp}" = "8" ]; then
+        case "${name}" in
+            # Cost-model optima from inspect_pipe_sp_splits.py:
+            #   full_comp: all-full-attention cost model
+            #   hcomp: period4 hybrid-attention cost model
+            full_comp) echo "17152,10368,8320,7168,6400,5760,5376,4992" ;;
+            hcomp)     echo "12032,9728,8704,7936,7424,6912,6528,6272" ;;
+            # Approximate 25/50/75% interpolation from average to hcomp,
+            # rounded to 128 while keeping the sum at 65536.
+            very_mild) echo "9088,8576,8320,8192,7936,7936,7808,7680" ;;
+            mild)      echo "10112,8960,8448,8064,7808,7552,7424,7168" ;;
+            medium)    echo "11008,9344,8576,7936,7680,7296,6912,6784" ;;
+            *)
+                echo "ERROR: unknown manual split '${name}' for seq=${seq} sp=${sp}" >&2
+                return 1
+                ;;
+        esac
+        return 0
+    fi
     echo "ERROR: no manual split table for seq=${seq} sp=${sp} name=${name}" >&2
     return 1
 }
