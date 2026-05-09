@@ -95,6 +95,7 @@ NO_SAVE=${NO_SAVE:-0}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 PIPE_SP_STRATEGY=${PIPE_SP_STRATEGY:-average}
 PIPE_SP_MANUAL_SPLITS=${PIPE_SP_MANUAL_SPLITS:-}
+USE_DELTANET=${USE_DELTANET:-1}
 
 # --- distributed ---
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
@@ -175,6 +176,7 @@ echo "  pipe_sp_str  = ${PIPE_SP_STRATEGY}"
 if [ -n "${PIPE_SP_MANUAL_SPLITS}" ]; then
     echo "  manual_split = ${PIPE_SP_MANUAL_SPLITS}"
 fi
+echo "  use_deltanet = ${USE_DELTANET}"
 echo "  fused_solve  = ${FLA_USE_FUSED_SOLVE_WU}"
 echo "  resume       = ${RESUME}"
 echo "  torchrun     = $([ "${TORCHRUN_STANDALONE}" = "1" ] && echo standalone || echo c10d)"
@@ -223,6 +225,17 @@ run_one() {
             exit 1
         fi
         PIPE_SP_MANUAL_ARGS="--pipe-sp-manual-splits ${PIPE_SP_MANUAL_SPLITS}"
+    fi
+    local DELTANET_ARGS=""
+    if [ "${USE_DELTANET}" = "1" ]; then
+        DELTANET_ARGS=" \
+        --use-deltanet \
+        --deltanet-mode chunk \
+        --deltanet-conv-size 4 \
+        --deltanet-qk-activation silu \
+        --deltanet-qk-norm l2 \
+        --deltanet-use-beta \
+        --deltanet-use-short-conv"
     fi
 
     local DISTRIBUTED_ARGS
@@ -274,13 +287,7 @@ run_one() {
         --tensorboard-queue-size 10 \
         --log-timers-to-tensorboard \
         --log-validation-ppl-to-tensorboard \
-        --use-deltanet \
-        --deltanet-mode chunk \
-        --deltanet-conv-size 4 \
-        --deltanet-qk-activation silu \
-        --deltanet-qk-norm l2 \
-        --deltanet-use-beta \
-        --deltanet-use-short-conv \
+        ${DELTANET_ARGS} \
         --untie-embeddings-and-output-weights \
         --hidden-dropout 0 \
         --attention-dropout 0 \
