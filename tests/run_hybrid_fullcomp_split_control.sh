@@ -86,10 +86,10 @@ manual_splits() {
             #   hcomp: period4 hybrid-attention cost model
             full_comp) echo "27136,15616,12288,10496" ;;
             hcomp)     echo "21248,16896,14464,12928" ;;
-            # Manual 64K counterparts of the 32K mildness sweep.
-            very_mild) echo "16640,16384,16384,16128" ;;
-            mild)      echo "16896,16640,16128,15872" ;;
-            medium)    echo "17408,16640,16128,15360" ;;
+            # 25/50/75% interpolation from average to hcomp, rounded to 128.
+            very_mild) echo "17664,16512,15872,15488" ;;
+            mild)      echo "18816,16640,15488,14592" ;;
+            medium)    echo "19968,16768,14976,13824" ;;
             *)
                 echo "ERROR: unknown manual split '${name}' for seq=${seq} sp=${sp}" >&2
                 return 1
