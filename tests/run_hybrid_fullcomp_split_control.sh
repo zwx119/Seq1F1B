@@ -79,6 +79,21 @@ manual_splits() {
         esac
         return 0
     fi
+    if [ "${seq}" = "65536" ] && [ "${sp}" = "4" ]; then
+        case "${name}" in
+            # 64K counterparts of the 32K split-control table above.
+            full_comp) echo "23808,16640,13568,11520" ;;
+            very_mild) echo "16640,16384,16384,16128" ;;
+            mild)      echo "16896,16640,16128,15872" ;;
+            medium)    echo "17408,16640,16128,15360" ;;
+            hcomp)     echo "18944,16896,15360,14336" ;;
+            *)
+                echo "ERROR: unknown manual split '${name}' for seq=${seq} sp=${sp}" >&2
+                return 1
+                ;;
+        esac
+        return 0
+    fi
     echo "ERROR: no manual split table for seq=${seq} sp=${sp} name=${name}" >&2
     return 1
 }
