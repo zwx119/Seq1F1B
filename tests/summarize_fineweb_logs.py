@@ -32,6 +32,7 @@ ITER_RE = re.compile(
     r"TFlops/s:\s*(?P<tflops>[0-9.]+).*?"
     r"mem_each_stage:\s*(?P<mem>[0-9.,]+)"
 )
+REPEAT_SUFFIX_RE = re.compile(r"(?P<base>.+?)(?:_run\d+|_[a-z])$")
 
 
 @dataclass
@@ -62,6 +63,64 @@ def mean_pm(values: list[float], digits: int = 2) -> str:
     mean = statistics.fmean(values)
     std = statistics.pstdev(values) if len(values) > 1 else 0.0
     return f"{mean:.{digits}f}+-{std:.{digits}f}"
+
+
+def mean_value(value: str | None) -> float | None:
+    if not value:
+        return None
+    return float(value.split("+-", 1)[0])
+
+
+def base_repeat_label(label: str) -> str:
+    match = REPEAT_SUFFIX_RE.fullmatch(label)
+    return match.group("base") if match else label
+
+
+def aggregate_repeats(summaries: list[LogSummary]) -> list[LogSummary]:
+    grouped: dict[str, list[LogSummary]] = {}
+    order: list[str] = []
+    for item in summaries:
+        base = base_repeat_label(item.label)
+        if base not in grouped:
+            grouped[base] = []
+            order.append(base)
+        grouped[base].append(item)
+
+    aggregated: list[LogSummary] = []
+    for base in order:
+        items = grouped[base]
+        if len(items) == 1:
+            aggregated.append(items[0])
+            continue
+
+        ok_items = [item for item in items if item.status == "OK"]
+        status = "OK" if len(ok_items) == len(items) else f"PARTIAL_OK_{len(ok_items)}_OF_{len(items)}"
+        metric_values = {
+            key: [value for value in (mean_value(getattr(item, key)) for item in ok_items) if value is not None]
+            for key in ("time", "toks", "tflops")
+        }
+
+        mem_rows: list[list[float]] = []
+        for item in ok_items:
+            if not item.mem_arr:
+                continue
+            mem_rows.append([float(value) for value in item.mem_arr.split("/") if value])
+        mem_arr = None
+        if mem_rows and len({len(row) for row in mem_rows}) == 1:
+            mem_arr = "/".join(f"{statistics.fmean(stage):.1f}" for stage in zip(*mem_rows))
+
+        aggregated.append(
+            LogSummary(
+                label=base,
+                path=Path(f"{len(ok_items)}/{len(items)} repeats"),
+                time=mean_pm(metric_values["time"]) if metric_values["time"] else None,
+                toks=mean_pm(metric_values["toks"]) if metric_values["toks"] else None,
+                tflops=mean_pm(metric_values["tflops"]) if metric_values["tflops"] else None,
+                mem_arr=mem_arr,
+                status=status,
+            )
+        )
+    return aggregated
 
 
 def parse_compact_summary(lines: list[str]) -> dict[str, str]:
@@ -192,6 +251,7 @@ def main() -> None:
         print(f"NO_LOGS_FOUND: {args.root}")
         return
 
+    summaries = aggregate_repeats(summaries)
     print_summary(summaries)
     if args.csv is not None:
         write_csv(args.csv, summaries)

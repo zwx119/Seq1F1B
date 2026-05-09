@@ -11,6 +11,7 @@
 #   - hybrid: period4, every 4 layers has 1 full-attention layer
 #   - Seq1F1B splits: sp=4
 #   - split: full_comp from the all-full-attention cost model
+#   - repeats: 3, summarized by tests/summarize_fineweb_logs.py as an average
 
 set -uo pipefail
 
@@ -28,6 +29,7 @@ SEQ_LIST="${SEQ_LIST:-32768}"
 SP_LIST="${SP_LIST:-4}"
 SPLIT_LIST="${SPLIT_LIST:-full_comp}"
 HYBRID_LIST="${HYBRID_LIST:-period4}"
+REPEAT_COUNT="${REPEAT_COUNT:-3}"
 
 NUM_LAYERS="${NUM_LAYERS:-32}"
 HIDDEN="${HIDDEN:-2560}"
@@ -90,6 +92,7 @@ echo "  HYBRID_LIST=${HYBRID_LIST}"
 echo "  SPLIT_LIST=${SPLIT_LIST}"
 echo "  SEQ_LIST=${SEQ_LIST}"
 echo "  SP_LIST=${SP_LIST}"
+echo "  REPEAT_COUNT=${REPEAT_COUNT}"
 echo "  model=L${NUM_LAYERS}/H${HIDDEN}/A${NUM_HEADS} GBS=${GLOBAL_BATCH}"
 
 declare -a RUN_STATUSES=()
@@ -118,32 +121,40 @@ for hybrid in ${HYBRID_LIST}; do
                         ;;
                 esac
 
-                out_dir="${OUT_ROOT}/${hybrid}_seq${seq}_gbs${GLOBAL_BATCH}_sp${sp}_${split_name}"
-                echo ""
-                echo "======================================================================"
-                echo "Running ${hybrid} seq=${seq} sp=${sp} split=${split_name}"
-                if [ -n "${manual}" ]; then
-                    echo "  manual=${manual}"
-                fi
-                echo "  out=${out_dir}"
-                echo "======================================================================"
+                base_dir="${OUT_ROOT}/${hybrid}_seq${seq}_gbs${GLOBAL_BATCH}_sp${sp}_${split_name}"
+                for repeat in $(seq 1 "${REPEAT_COUNT}"); do
+                    if [ "${REPEAT_COUNT}" -gt 1 ]; then
+                        out_dir="${base_dir}_run${repeat}"
+                    else
+                        out_dir="${base_dir}"
+                    fi
 
-                OUT_DIR="${out_dir}" \
-                NUM_LAYERS="${NUM_LAYERS}" HIDDEN="${HIDDEN}" NUM_HEADS="${NUM_HEADS}" \
-                SEQ_LEN="${seq}" GLOBAL_BATCH="${GLOBAL_BATCH}" MICRO_BATCH="${MICRO_BATCH}" \
-                TRAIN_ITERS="${TRAIN_ITERS}" WARMUP_ITERS="${WARMUP_ITERS}" \
-                GPUS_PER_NODE_USER=1 GPUS_PER_NODE="${GPUS_PER_NODE}" \
-                PP_SIZE="${PP_SIZE}" TP_SIZE="${TP_SIZE}" \
-                SEQ1F1B_SP="${sp}" ONLY=seq \
-                NO_SAVE="${NO_SAVE}" LOG_INTERVAL="${LOG_INTERVAL}" EVAL_ITERS="${EVAL_ITERS}" \
-                PIPE_SP_STRATEGY="${strategy}" PIPE_SP_MANUAL_SPLITS="${manual}" \
-                EXTRA_ARGS="${extra_args}" \
-                bash "${RUNNER}"
-                status=$?
-                RUN_STATUSES+=("${hybrid}:seq${seq}:sp${sp}:${split_name}:${status}")
-                if [ "${status}" -ne 0 ]; then
-                    echo "FAILED/OOM: ${hybrid} seq=${seq} sp=${sp} split=${split_name}"
-                fi
+                    echo ""
+                    echo "======================================================================"
+                    echo "Running ${hybrid} seq=${seq} sp=${sp} split=${split_name} repeat=${repeat}/${REPEAT_COUNT}"
+                    if [ -n "${manual}" ]; then
+                        echo "  manual=${manual}"
+                    fi
+                    echo "  out=${out_dir}"
+                    echo "======================================================================"
+
+                    OUT_DIR="${out_dir}" \
+                    NUM_LAYERS="${NUM_LAYERS}" HIDDEN="${HIDDEN}" NUM_HEADS="${NUM_HEADS}" \
+                    SEQ_LEN="${seq}" GLOBAL_BATCH="${GLOBAL_BATCH}" MICRO_BATCH="${MICRO_BATCH}" \
+                    TRAIN_ITERS="${TRAIN_ITERS}" WARMUP_ITERS="${WARMUP_ITERS}" \
+                    GPUS_PER_NODE_USER=1 GPUS_PER_NODE="${GPUS_PER_NODE}" \
+                    PP_SIZE="${PP_SIZE}" TP_SIZE="${TP_SIZE}" \
+                    SEQ1F1B_SP="${sp}" ONLY=seq \
+                    NO_SAVE="${NO_SAVE}" LOG_INTERVAL="${LOG_INTERVAL}" EVAL_ITERS="${EVAL_ITERS}" \
+                    PIPE_SP_STRATEGY="${strategy}" PIPE_SP_MANUAL_SPLITS="${manual}" \
+                    EXTRA_ARGS="${extra_args}" \
+                    bash "${RUNNER}"
+                    status=$?
+                    RUN_STATUSES+=("${hybrid}:seq${seq}:sp${sp}:${split_name}:run${repeat}:${status}")
+                    if [ "${status}" -ne 0 ]; then
+                        echo "FAILED/OOM: ${hybrid} seq=${seq} sp=${sp} split=${split_name} repeat=${repeat}"
+                    fi
+                done
             done
         done
     done
