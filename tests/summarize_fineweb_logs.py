@@ -8,10 +8,10 @@ The training runner prints compact summary lines at the end of each log:
     tflops:  154.05+-1.48
     mem_arr:  31.9/27.6/...
 
-This helper collects those blocks recursively from an experiment root. If a log
-was interrupted before the compact summary was printed, it falls back to parsing
-per-iteration timing lines and computes an approximate summary after skipping
-the first few warmup iterations.
+This helper collects logs recursively from an experiment root and, when
+possible, computes averages directly from the per-iteration timing lines. If a
+log does not contain those lines, it falls back to the compact summary printed
+at the end of training.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ ITER_RE = re.compile(
     r"TFlops/s:\s*(?P<tflops>[0-9.]+).*?"
     r"mem_each_stage:\s*(?P<mem>[0-9.,]+)"
 )
-REPEAT_SUFFIX_RE = re.compile(r"(?P<base>.+?)(?:_run\d+|_[a-z])$")
 
 
 @dataclass
@@ -63,64 +62,6 @@ def mean_pm(values: list[float], digits: int = 2) -> str:
     mean = statistics.fmean(values)
     std = statistics.pstdev(values) if len(values) > 1 else 0.0
     return f"{mean:.{digits}f}+-{std:.{digits}f}"
-
-
-def mean_value(value: str | None) -> float | None:
-    if not value:
-        return None
-    return float(value.split("+-", 1)[0])
-
-
-def base_repeat_label(label: str) -> str:
-    match = REPEAT_SUFFIX_RE.fullmatch(label)
-    return match.group("base") if match else label
-
-
-def aggregate_repeats(summaries: list[LogSummary]) -> list[LogSummary]:
-    grouped: dict[str, list[LogSummary]] = {}
-    order: list[str] = []
-    for item in summaries:
-        base = base_repeat_label(item.label)
-        if base not in grouped:
-            grouped[base] = []
-            order.append(base)
-        grouped[base].append(item)
-
-    aggregated: list[LogSummary] = []
-    for base in order:
-        items = grouped[base]
-        if len(items) == 1:
-            aggregated.append(items[0])
-            continue
-
-        ok_items = [item for item in items if item.status == "OK"]
-        status = "OK" if len(ok_items) == len(items) else f"PARTIAL_OK_{len(ok_items)}_OF_{len(items)}"
-        metric_values = {
-            key: [value for value in (mean_value(getattr(item, key)) for item in ok_items) if value is not None]
-            for key in ("time", "toks", "tflops")
-        }
-
-        mem_rows: list[list[float]] = []
-        for item in ok_items:
-            if not item.mem_arr:
-                continue
-            mem_rows.append([float(value) for value in item.mem_arr.split("/") if value])
-        mem_arr = None
-        if mem_rows and len({len(row) for row in mem_rows}) == 1:
-            mem_arr = "/".join(f"{statistics.fmean(stage):.1f}" for stage in zip(*mem_rows))
-
-        aggregated.append(
-            LogSummary(
-                label=base,
-                path=Path(f"{len(ok_items)}/{len(items)} repeats"),
-                time=mean_pm(metric_values["time"]) if metric_values["time"] else None,
-                toks=mean_pm(metric_values["toks"]) if metric_values["toks"] else None,
-                tflops=mean_pm(metric_values["tflops"]) if metric_values["tflops"] else None,
-                mem_arr=mem_arr,
-                status=status,
-            )
-        )
-    return aggregated
 
 
 def parse_compact_summary(lines: list[str]) -> dict[str, str]:
@@ -171,9 +112,9 @@ def detect_failure(lines: list[str]) -> str:
 
 def summarize_log(root: Path, log: Path, label: str, skip_iters: int) -> LogSummary:
     lines = log.read_text(errors="replace").splitlines()
-    compact = parse_compact_summary(lines)
-    fallback = {} if all(k in compact for k in SUMMARY_KEYS) else parse_iter_fallback(lines, skip_iters)
-    data = {**fallback, **compact}
+    iter_summary = parse_iter_fallback(lines, skip_iters)
+    compact = {} if all(k in iter_summary for k in SUMMARY_KEYS) else parse_compact_summary(lines)
+    data = {**compact, **iter_summary}
     status = "OK" if all(k in data for k in SUMMARY_KEYS) else detect_failure(lines)
     return LogSummary(
         label=label,
@@ -238,7 +179,7 @@ def write_csv(path: Path, summaries: list[LogSummary]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="Experiment output root")
-    parser.add_argument("--skip-iters", type=int, default=2, help="Fallback parser warmup iterations to skip")
+    parser.add_argument("--skip-iters", type=int, default=1, help="Warmup iterations to skip when averaging per-iteration lines")
     parser.add_argument("--csv", type=Path, default=None, help="Optional CSV output path")
     args = parser.parse_args()
 
@@ -251,7 +192,6 @@ def main() -> None:
         print(f"NO_LOGS_FOUND: {args.root}")
         return
 
-    summaries = aggregate_repeats(summaries)
     print_summary(summaries)
     if args.csv is not None:
         write_csv(args.csv, summaries)
