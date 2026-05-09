@@ -291,7 +291,7 @@ def get_batch_sp_func_factory():
         offset = (offset + 1) % pipe_sp
         tokens, labels, loss_mask, attention_mask, position_ids = global_data
         seq_length = tokens.size(1)
-        if pipe_sp > 1 and parsed_args.pipe_sp_strategy in ("uniform_comp", "hybrid_comp"):
+        if pipe_sp > 1 and parsed_args.pipe_sp_strategy in ("uniform_comp", "hybrid_comp", "manual"):
             splits = get_splits()
             start = sum(splits[:offset])
             end = start + splits[offset]
