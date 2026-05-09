@@ -423,6 +423,8 @@ class DeltaNetAttention(MegatronModule):
         self.conv_state_q = None
         self.conv_state_k = None
         self.conv_state_v = None
+        self._beta_precompute_stream = None
+        self._beta_precompute_event = None
 
     def _clear_states(self):
         """Clear all cached states. Called when micro_sp_idx == 0."""
@@ -433,8 +435,40 @@ class DeltaNetAttention(MegatronModule):
         self.conv_state_k = None
         self.conv_state_v = None
 
+    def _should_overlap_beta_precompute(self):
+        args = get_args()
+        return (
+            self.use_beta
+            and getattr(args, 'deltanet_overlap_beta_precompute', False)
+            and torch.cuda.is_available()
+        )
+
+    def _start_beta_precompute(self, hidden_states_bsh):
+        """Launch beta/b_proj on a side stream for the current chunk.
+
+        This hides state-independent beta PRE work under q/k/v short-conv and
+        layout work in the same forward call. True C_i -> C_{i+1} lookahead
+        would require scheduler-level access to the next chunk's activations.
+        """
+        if not self._should_overlap_beta_precompute() or not hidden_states_bsh.is_cuda:
+            return None, None
+
+        if self._beta_precompute_stream is None:
+            self._beta_precompute_stream = torch.cuda.Stream(device=hidden_states_bsh.device)
+            self._beta_precompute_event = torch.cuda.Event()
+
+        main_stream = torch.cuda.current_stream(hidden_states_bsh.device)
+        self._beta_precompute_stream.wait_stream(main_stream)
+        with torch.cuda.stream(self._beta_precompute_stream):
+            torch.cuda.nvtx.range_push("DeltaNet/beta_precompute")
+            beta = self.b_proj(hidden_states_bsh).sigmoid()
+            torch.cuda.nvtx.range_pop()
+            self._beta_precompute_event.record(self._beta_precompute_stream)
+        return beta, self._beta_precompute_event
+
     def _stateful_middle(self, q, k, v, hidden_states_bsh,
-                          use_conv_cache, output_final_state):
+                          use_conv_cache, output_final_state,
+                          precomputed_beta=None, beta_ready_event=None):
         """Stateful middle section: short conv -> reshape -> beta -> delta rule.
 
         Runs on a single (possibly chunked) slice of the sequence. All the
@@ -501,7 +535,12 @@ class DeltaNetAttention(MegatronModule):
 
         # ============ Beta ============
         if self.use_beta:
-            beta = self.b_proj(hidden_states_bsh).sigmoid()
+            if precomputed_beta is not None:
+                if beta_ready_event is not None:
+                    torch.cuda.current_stream(precomputed_beta.device).wait_event(beta_ready_event)
+                beta = precomputed_beta
+            else:
+                beta = self.b_proj(hidden_states_bsh).sigmoid()
         else:
             beta = torch.ones(
                 batch_size, seq_len, self.num_attention_heads_per_partition,
@@ -680,10 +719,13 @@ class DeltaNetAttention(MegatronModule):
             use_conv_cache = (args.pipe_sp_splits > 1 and micro_sp_idx is not None
                               and micro_sp_idx > 0)
             output_final_state = (args.pipe_sp_splits > 1)
+            beta, beta_ready = self._start_beta_precompute(hidden_states_bsh)
             o = self._stateful_middle(
                 q, k, v, hidden_states_bsh,
                 use_conv_cache=use_conv_cache,
                 output_final_state=output_final_state,
+                precomputed_beta=beta,
+                beta_ready_event=beta_ready,
             )
 
         # ============ Output normalization & gate ============

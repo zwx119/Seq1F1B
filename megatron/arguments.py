@@ -628,6 +628,13 @@ def _add_deltanet_args(parser):
     group.add_argument('--no-deltanet-beta', action='store_false',
                        dest='deltanet_use_beta',
                        help='Disable learned beta, using fixed beta=1.')
+    group.add_argument('--deltanet-overlap-beta-precompute',
+                       action='store_true', default=False,
+                       help='Compute DeltaNet beta/b_proj on a side CUDA '
+                       'stream and wait for it right before the delta-rule '
+                       'kernel. This is an opt-in experiment to hide the '
+                       'state-independent beta PRE work under q/k/v short '
+                       'convolution without splitting fused qkvg projection.')
     group.add_argument('--deltanet-use-output-gate', action='store_true',
                        default=True,
                        help='Use an output gating mechanism. Default: True.')
