@@ -81,12 +81,15 @@ manual_splits() {
     fi
     if [ "${seq}" = "65536" ] && [ "${sp}" = "4" ]; then
         case "${name}" in
-            # 64K counterparts of the 32K split-control table above.
-            full_comp) echo "23808,16640,13568,11520" ;;
+            # Cost-model optima from inspect_pipe_sp_splits.py:
+            #   full_comp: all-full-attention cost model
+            #   hcomp: period4 hybrid-attention cost model
+            full_comp) echo "27136,15616,12288,10496" ;;
+            hcomp)     echo "21248,16896,14464,12928" ;;
+            # Manual 64K counterparts of the 32K mildness sweep.
             very_mild) echo "16640,16384,16384,16128" ;;
             mild)      echo "16896,16640,16128,15872" ;;
             medium)    echo "17408,16640,16128,15360" ;;
-            hcomp)     echo "18944,16896,15360,14336" ;;
             *)
                 echo "ERROR: unknown manual split '${name}' for seq=${seq} sp=${sp}" >&2
                 return 1
