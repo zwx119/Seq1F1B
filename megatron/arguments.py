@@ -631,10 +631,11 @@ def _add_deltanet_args(parser):
     group.add_argument('--deltanet-overlap-beta-precompute',
                        action='store_true', default=False,
                        help='Compute DeltaNet beta/b_proj on a side CUDA '
-                       'stream and wait for it right before the delta-rule '
-                       'kernel. This is an opt-in experiment to hide the '
-                       'state-independent beta PRE work under q/k/v short '
-                       'convolution without splitting fused qkvg projection.')
+                       'stream. In --force-seq-chunks mode this uses a '
+                       'one-chunk beta lookahead so beta(C_i+1) can overlap '
+                       'the current chunk core; in ordinary one-chunk forward '
+                       'it precomputes the current chunk beta before the '
+                       'delta-rule kernel. This does not split fused qkvg.')
     group.add_argument('--deltanet-use-output-gate', action='store_true',
                        default=True,
                        help='Use an output gating mechanism. Default: True.')

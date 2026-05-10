@@ -424,7 +424,6 @@ class DeltaNetAttention(MegatronModule):
         self.conv_state_k = None
         self.conv_state_v = None
         self._beta_precompute_stream = None
-        self._beta_precompute_event = None
 
     def _clear_states(self):
         """Clear all cached states. Called when micro_sp_idx == 0."""
@@ -443,7 +442,7 @@ class DeltaNetAttention(MegatronModule):
             and torch.cuda.is_available()
         )
 
-    def _start_beta_precompute(self, hidden_states_bsh):
+    def _start_beta_precompute(self, hidden_states_bsh, wait_main_stream=True):
         """Launch beta/b_proj on a side stream for the current chunk.
 
         This hides state-independent beta PRE work under q/k/v short-conv and
@@ -455,16 +454,17 @@ class DeltaNetAttention(MegatronModule):
 
         if self._beta_precompute_stream is None:
             self._beta_precompute_stream = torch.cuda.Stream(device=hidden_states_bsh.device)
-            self._beta_precompute_event = torch.cuda.Event()
 
-        main_stream = torch.cuda.current_stream(hidden_states_bsh.device)
-        self._beta_precompute_stream.wait_stream(main_stream)
+        if wait_main_stream:
+            main_stream = torch.cuda.current_stream(hidden_states_bsh.device)
+            self._beta_precompute_stream.wait_stream(main_stream)
+        beta_ready_event = torch.cuda.Event()
         with torch.cuda.stream(self._beta_precompute_stream):
             torch.cuda.nvtx.range_push("DeltaNet/beta_precompute")
             beta = self.b_proj(hidden_states_bsh).sigmoid()
             torch.cuda.nvtx.range_pop()
-            self._beta_precompute_event.record(self._beta_precompute_stream)
-        return beta, self._beta_precompute_event
+            beta_ready_event.record(self._beta_precompute_stream)
+        return beta, beta_ready_event
 
     def _stateful_middle(self, q, k, v, hidden_states_bsh,
                           use_conv_cache, output_final_state,
@@ -698,15 +698,48 @@ class DeltaNetAttention(MegatronModule):
             self._clear_states()
             chunk = seq_len // fsc
             outs = []
+            use_beta_lookahead = self._should_overlap_beta_precompute()
+            hidden_chunks = None
+            beta_cache = None
+            beta_events = None
+
+            if use_beta_lookahead:
+                hidden_chunks = [
+                    hidden_states_bsh[:, i * chunk:(i + 1) * chunk].contiguous()
+                    for i in range(fsc)
+                ]
+                beta_cache = [None] * fsc
+                beta_events = [None] * fsc
+
+                def launch_beta_chunk(j):
+                    if j >= fsc or beta_cache[j] is not None:
+                        return
+                    beta_cache[j], beta_events[j] = self._start_beta_precompute(
+                        hidden_chunks[j],
+                        wait_main_stream=(j == 0),
+                    )
+
+                # Prime the side-stream queue. Chunk 0 beta can overlap this
+                # chunk's short-conv/layout; chunk 1 beta can overlap chunk 0
+                # state/core once the side stream reaches it.
+                launch_beta_chunk(0)
+                launch_beta_chunk(1)
+            else:
+                launch_beta_chunk = None
+
             for i in range(fsc):
                 sl = slice(i * chunk, (i + 1) * chunk)
+                if use_beta_lookahead and launch_beta_chunk is not None:
+                    launch_beta_chunk(i + 1)
                 o_i = self._stateful_middle(
                     q[:, sl].contiguous(),
                     k[:, sl].contiguous(),
                     v[:, sl].contiguous(),
-                    hidden_states_bsh[:, sl].contiguous(),
+                    hidden_chunks[i] if hidden_chunks is not None else hidden_states_bsh[:, sl].contiguous(),
                     use_conv_cache=(i > 0),
                     output_final_state=True,
+                    precomputed_beta=beta_cache[i] if beta_cache is not None else None,
+                    beta_ready_event=beta_events[i] if beta_events is not None else None,
                 )
                 outs.append(o_i)
             # Clear transient cross-chunk state so that subsequent forward
