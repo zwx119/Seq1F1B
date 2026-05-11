@@ -243,6 +243,7 @@ class DeltaNetChunkFunc(torch.autograd.Function):
         fused_beta_out=None,
         fused_beta_apply_sigmoid=True,
         fused_beta_block_n=32,
+        use_ho_pipeline=False,
     ):
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
@@ -266,6 +267,7 @@ class DeltaNetChunkFunc(torch.autograd.Function):
             fused_beta_out=fused_beta_out,
             fused_beta_apply_sigmoid=fused_beta_apply_sigmoid,
             fused_beta_block_n=fused_beta_block_n,
+            use_ho_pipeline=use_ho_pipeline,
         )
 
         # Store final_state in cache for next chunk's forward
@@ -314,7 +316,7 @@ class DeltaNetChunkFunc(torch.autograd.Function):
         # pre_h_hook, fused_beta_x, fused_beta_weight, fused_beta_out,
         # fused_beta_apply_sigmoid, fused_beta_block_n
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), \
-               None, None, None, None, None, None, None, None, None
+               None, None, None, None, None, None, None, None, None, None
 
 
 class DeltaNetAttention(MegatronModule):
@@ -523,6 +525,13 @@ class DeltaNetAttention(MegatronModule):
             and not self.sequence_parallel
         )
 
+    def _should_use_ho_pipeline(self):
+        args = get_args()
+        return (
+            getattr(args, 'deltanet_fused_h_o_pipeline', False)
+            and torch.cuda.is_available()
+        )
+
     def _start_beta_precompute(self, hidden_states_bsh, wait_main_stream=True):
         """Launch beta/b_proj for the provided chunk on a side stream.
 
@@ -668,6 +677,7 @@ class DeltaNetAttention(MegatronModule):
                 fused_beta_out,
                 fused_beta_apply_sigmoid,
                 fused_beta_block_n,
+                self._should_use_ho_pipeline(),
             )
             if needs_cast:
                 o = o.to(orig_dtype)
@@ -677,6 +687,7 @@ class DeltaNetAttention(MegatronModule):
                 initial_state=initial_state,
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
+                use_ho_pipeline=self._should_use_ho_pipeline(),
             )
             if output_final_state and recurrent_state is not None:
                 self.state_cache['recurrent_state'] = recurrent_state.detach()
