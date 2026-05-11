@@ -408,6 +408,12 @@ def validate_args(args, defaults={}):
             _parse_int_list_or_ranges(
                 args.deltanet_hybrid_attention_layers,
                 '--deltanet-hybrid-attention-layers')
+        if (getattr(args, 'deltanet_fused_h_beta_precompute', False)
+                and getattr(args, 'deltanet_fused_h_qkvg_precompute', False)):
+            raise RuntimeError(
+                '--deltanet-fused-h-beta-precompute and '
+                '--deltanet-fused-h-qkvg-precompute both use the same fused H '
+                'projection slot; enable only one of them.')
         # DeltaNet requires fla library
         try:
             from fla.ops.delta_rule.chunk import chunk_delta_rule  # noqa: F401
@@ -647,6 +653,14 @@ def _add_deltanet_args(parser):
                        'an end-to-end prototype of same-layer next-chunk beta '
                        'lookahead; gradients for b_proj are restored with a '
                        'custom autograd wrapper.')
+    group.add_argument('--deltanet-fused-h-qkvg-precompute',
+                       action='store_true', default=False,
+                       help='In --force-seq-chunks mode with output gate and '
+                       'TP=1, fuse DeltaNet H(C_i) with qkvg_proj(C_i+1) in '
+                       'one Triton launch and reuse the cached q/k/v/g when '
+                       'C_i+1 arrives. This is a forward prototype; qkvg '
+                       'linear gradients are restored with a custom autograd '
+                       'wrapper.')
     group.add_argument('--deltanet-use-output-gate', action='store_true',
                        default=True,
                        help='Use an output gating mechanism. Default: True.')
