@@ -556,8 +556,7 @@ class DeltaNetAttention(MegatronModule):
                           fused_beta_weight=None,
                           fused_beta_out=None,
                           fused_beta_apply_sigmoid=True,
-                          fused_beta_block_n=32,
-                          force_chunk_delta=False):
+                          fused_beta_block_n=32):
         """Stateful middle section: short conv -> reshape -> beta -> delta rule.
 
         Runs on a single (possibly chunked) slice of the sequence. All the
@@ -644,9 +643,7 @@ class DeltaNetAttention(MegatronModule):
             )
 
         # ============ DeltaNet core computation ============
-        mode = self.deltanet_mode if force_chunk_delta else (
-            'fused_recurrent' if seq_len <= 64 else self.deltanet_mode
-        )
+        mode = 'fused_recurrent' if seq_len <= 64 else self.deltanet_mode
         initial_state = self.state_cache.get('recurrent_state', None)
 
         if output_final_state and mode == 'chunk':
@@ -732,8 +729,6 @@ class DeltaNetAttention(MegatronModule):
         """
         args = get_args()
         fsc = getattr(args, 'force_seq_chunks', 1)
-        internal_chunk_size = 64
-        seq_len_hint = hidden_states.shape[0]
 
         # Handle micro_sp_idx
         if micro_sp_idx is not None:
@@ -747,19 +742,9 @@ class DeltaNetAttention(MegatronModule):
             and fsc > 1
             and (micro_sp_idx is None or micro_sp_idx == 0)
         )
-        use_internal_fused_requested = (
-            not use_force_chunks_requested
-            and self.deltanet_mode == 'chunk'
-            and seq_len_hint > internal_chunk_size
-            and seq_len_hint % internal_chunk_size == 0
-            and (
-                self._should_fuse_h_beta_precompute()
-                or self._should_fuse_h_qkvg_precompute()
-            )
-        )
         use_fused_h_qkvg_early = (
-            self._should_fuse_h_qkvg_precompute()
-            and (use_force_chunks_requested or use_internal_fused_requested)
+            use_force_chunks_requested
+            and self._should_fuse_h_qkvg_precompute()
         )
 
         # hidden_states: [s, b, h] (Megatron convention)
@@ -818,138 +803,7 @@ class DeltaNetAttention(MegatronModule):
             and fsc > 1
             and (micro_sp_idx is None or micro_sp_idx == 0)
         )
-        use_internal_chunk_overlap = (
-            not use_force_chunks
-            and self.deltanet_mode == 'chunk'
-            and seq_len > internal_chunk_size
-            and seq_len % internal_chunk_size == 0
-            and (
-                self._should_fuse_h_beta_precompute()
-                or self._should_fuse_h_qkvg_precompute()
-            )
-        )
-        if use_internal_chunk_overlap:
-            # Real same-layer DeltaNet-internal lookahead path.  This exposes
-            # the FLA BT=64 recurrent chunks to the Python scheduler, so
-            # H(BT_i) can co-schedule the projection for BT_{i+1} in the same
-            # Triton launch.  It does not rely on --force-seq-chunks.
-            chunk = internal_chunk_size
-            n_chunks = seq_len // chunk
-            owns_full_sequence = not (
-                args.pipe_sp_splits > 1 and micro_sp_idx is not None
-            )
-            if owns_full_sequence:
-                self._clear_states()
-
-            outs = []
-            use_fused_h_qkvg = self._should_fuse_h_qkvg_precompute()
-            use_fused_h_beta = (
-                self._should_fuse_h_beta_precompute()
-                and not use_fused_h_qkvg
-            )
-            hidden_chunks = [
-                hidden_states_bsh[:, i * chunk:(i + 1) * chunk].contiguous()
-                for i in range(n_chunks)
-            ]
-            beta_cache = [None] * n_chunks if use_fused_h_beta else None
-            beta_fused = [False] * n_chunks if use_fused_h_beta else None
-            qkvg_cache = [None] * n_chunks if use_fused_h_qkvg else None
-            g_chunks = [] if use_fused_h_qkvg else None
-
-            def _projection_weight(weight, dtype):
-                if weight.dtype != dtype:
-                    weight = weight.to(dtype)
-                return weight if weight.is_contiguous() else weight.contiguous()
-
-            def allocate_beta_chunk(j):
-                if beta_cache is None or j >= n_chunks or beta_cache[j] is not None:
-                    return
-                beta_cache[j] = hidden_chunks[j].new_empty(
-                    hidden_chunks[j].shape[0],
-                    hidden_chunks[j].shape[1],
-                    self.num_attention_heads_per_partition,
-                )
-                beta_fused[j] = True
-
-            def allocate_qkvg_chunk(j):
-                if qkvg_cache is None or j >= n_chunks or qkvg_cache[j] is not None:
-                    return
-                qkvg_cache[j] = hidden_chunks[j].new_empty(
-                    hidden_chunks[j].shape[0],
-                    hidden_chunks[j].shape[1],
-                    self.qkvg_proj.weight.shape[0],
-                )
-
-            for i in range(n_chunks):
-                sl = slice(i * chunk, (i + 1) * chunk)
-                fused_beta_x = None
-                fused_beta_weight = None
-                fused_beta_out = None
-                fused_beta_apply_sigmoid = True
-                fused_beta_block_n = 32
-
-                if use_fused_h_qkvg:
-                    if qkvg_cache[i] is None:
-                        qkvg_i_sbh, _ = self.qkvg_proj(
-                            hidden_chunks[i].transpose(0, 1).contiguous()
-                        )
-                        qkvg_i = qkvg_i_sbh.transpose(0, 1).contiguous()
-                    else:
-                        qkvg_i = PrecomputedLinearFunc.apply(
-                            hidden_chunks[i],
-                            self.qkvg_proj.weight,
-                            qkvg_cache[i],
-                        )
-                    q_i, k_i, v_i, g_i = torch.chunk(qkvg_i, 4, dim=-1)
-                    g_chunks.append(g_i)
-
-                if use_fused_h_qkvg and i + 1 < n_chunks:
-                    allocate_qkvg_chunk(i + 1)
-                    fused_beta_x = hidden_chunks[i + 1]
-                    fused_beta_weight = _projection_weight(
-                        self.qkvg_proj.weight, fused_beta_x.dtype)
-                    fused_beta_out = qkvg_cache[i + 1]
-                    fused_beta_apply_sigmoid = False
-                    fused_beta_block_n = 128
-                elif use_fused_h_beta and i + 1 < n_chunks:
-                    allocate_beta_chunk(i + 1)
-                    fused_beta_x = hidden_chunks[i + 1]
-                    fused_beta_weight = _projection_weight(
-                        self.b_proj.weight, fused_beta_x.dtype)
-                    fused_beta_out = beta_cache[i + 1]
-
-                o_i = self._stateful_middle(
-                    q_i.contiguous() if use_fused_h_qkvg else q[:, sl].contiguous(),
-                    k_i.contiguous() if use_fused_h_qkvg else k[:, sl].contiguous(),
-                    v_i.contiguous() if use_fused_h_qkvg else v[:, sl].contiguous(),
-                    hidden_chunks[i],
-                    use_conv_cache=(i > 0),
-                    output_final_state=True,
-                    precomputed_beta=(
-                        beta_cache[i]
-                        if beta_cache is not None and beta_cache[i] is not None
-                        else None
-                    ),
-                    precomputed_beta_fused=(
-                        beta_fused[i]
-                        if beta_fused is not None and beta_fused[i]
-                        else False
-                    ),
-                    fused_beta_x=fused_beta_x,
-                    fused_beta_weight=fused_beta_weight,
-                    fused_beta_out=fused_beta_out,
-                    fused_beta_apply_sigmoid=fused_beta_apply_sigmoid,
-                    fused_beta_block_n=fused_beta_block_n,
-                    force_chunk_delta=True,
-                )
-                outs.append(o_i)
-
-            o = torch.cat(outs, dim=1)
-            if use_fused_h_qkvg:
-                g = torch.cat(g_chunks, dim=1)
-            if owns_full_sequence:
-                self._clear_states()
-        elif use_force_chunks:
+        if use_force_chunks:
             assert seq_len % fsc == 0, (
                 f"seq_len {seq_len} must be divisible by "
                 f"--force-seq-chunks {fsc}")

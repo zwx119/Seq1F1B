@@ -647,21 +647,20 @@ def _add_deltanet_args(parser):
                        'DeltaNetAttention forward.')
     group.add_argument('--deltanet-fused-h-beta-precompute',
                        action='store_true', default=False,
-                       help='Fuse DeltaNet internal H(BT_i) with '
-                       'beta/b_proj(BT_i+1) in one Triton launch and reuse '
-                       'the cached beta when BT_i+1 arrives. Gradients for '
-                       'b_proj are restored with a custom autograd wrapper. '
-                       'The legacy --force-seq-chunks verification path also '
-                       'uses this flag.')
+                       help='In --force-seq-chunks mode, fuse DeltaNet '
+                       'H(C_i) with beta/b_proj(C_i+1) in one Triton launch '
+                       'and reuse the cached beta when C_i+1 arrives. This is '
+                       'an end-to-end prototype of same-layer next-chunk beta '
+                       'lookahead; gradients for b_proj are restored with a '
+                       'custom autograd wrapper.')
     group.add_argument('--deltanet-fused-h-qkvg-precompute',
                        action='store_true', default=False,
-                       help='With output gate and TP=1, fuse DeltaNet '
-                       'internal H(BT_i) with qkvg_proj(BT_i+1) in one '
-                       'Triton launch and reuse the cached q/k/v/g when '
-                       'BT_i+1 arrives. qkvg linear gradients are restored '
-                       'with a custom autograd wrapper. The legacy '
-                       '--force-seq-chunks verification path also uses this '
-                       'flag.')
+                       help='In --force-seq-chunks mode with output gate and '
+                       'TP=1, fuse DeltaNet H(C_i) with qkvg_proj(C_i+1) in '
+                       'one Triton launch and reuse the cached q/k/v/g when '
+                       'C_i+1 arrives. This is a forward prototype; qkvg '
+                       'linear gradients are restored with a custom autograd '
+                       'wrapper.')
     group.add_argument('--deltanet-use-output-gate', action='store_true',
                        default=True,
                        help='Use an output gating mechanism. Default: True.')
