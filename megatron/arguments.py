@@ -414,6 +414,17 @@ def validate_args(args, defaults={}):
                 '--deltanet-fused-h-beta-precompute and '
                 '--deltanet-fused-h-qkvg-precompute both use the same fused H '
                 'projection slot; enable only one of them.')
+        if (getattr(args, 'deltanet_overlap_beta_precompute', False)
+                or getattr(args, 'deltanet_fused_h_beta_precompute', False)
+                or getattr(args, 'deltanet_fused_h_qkvg_precompute', False)):
+            if getattr(args, 'force_seq_chunks', 1) <= 1:
+                raise RuntimeError(
+                    'DeltaNet beta/qkvg lookahead flags are currently only '
+                    'implemented for the --force-seq-chunks verification path. '
+                    'The attempted Python-level internal BT=64 implementation '
+                    'was disabled because it explodes kernel-launch overhead; '
+                    'a production internal-chunk version must be implemented '
+                    'inside the FLA PRE/H pipeline.')
         # DeltaNet requires fla library
         try:
             from fla.ops.delta_rule.chunk import chunk_delta_rule  # noqa: F401
