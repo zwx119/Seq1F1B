@@ -188,6 +188,7 @@ class DeltaNetChunkFunc(torch.autograd.Function):
         scale,
         state_cache,         # shared dict: holds 'recurrent_state' and 'd_state'
         use_qk_l2norm_in_kernel,
+        pre_h_hook=None,
     ):
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
@@ -205,6 +206,7 @@ class DeltaNetChunkFunc(torch.autograd.Function):
             output_final_state=True,
             cu_seqlens=None,
             chunk_indices=None,
+            pre_h_hook=pre_h_hook,
         )
 
         # Store final_state in cache for next chunk's forward
@@ -251,7 +253,7 @@ class DeltaNetChunkFunc(torch.autograd.Function):
 
         # grad for: q, k, v, beta, scale, state_cache, use_qk_l2norm
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), \
-               None, None, None
+               None, None, None, None
 
 
 class DeltaNetAttention(MegatronModule):
@@ -468,7 +470,8 @@ class DeltaNetAttention(MegatronModule):
 
     def _stateful_middle(self, q, k, v, hidden_states_bsh,
                           use_conv_cache, output_final_state,
-                          precomputed_beta=None, beta_ready_event=None):
+                          precomputed_beta=None, beta_ready_event=None,
+                          pre_h_hook=None):
         """Stateful middle section: short conv -> reshape -> beta -> delta rule.
 
         Runs on a single (possibly chunked) slice of the sequence. All the
@@ -482,6 +485,8 @@ class DeltaNetAttention(MegatronModule):
           hidden_states_bsh:   [b, s, h]                            (for b_proj)
           use_conv_cache:      bool — read self.conv_state_{q,k,v} as initial conv state
           output_final_state:  bool — update self.conv_state_{q,k,v} and self.state_cache
+          pre_h_hook:          optional callback launched after local PRE/beta,
+                               immediately before the DeltaNet state kernel
 
         Output:
           o: [b, s, num_heads_per_partition, head_dim]
@@ -567,6 +572,7 @@ class DeltaNetAttention(MegatronModule):
                 self.head_dim ** -0.5,
                 self.state_cache,
                 (self.qk_norm == 'l2'),
+                pre_h_hook,
             )
             if needs_cast:
                 o = o.to(orig_dtype)
@@ -716,20 +722,22 @@ class DeltaNetAttention(MegatronModule):
                         return
                     beta_cache[j], beta_events[j] = self._start_beta_precompute(
                         hidden_chunks[j],
-                        wait_main_stream=(j == 1),
+                        wait_main_stream=True,
                     )
 
-                # Prime one-chunk lookahead.  Chunk 0 computes beta normally;
-                # beta(C1) can overlap the stateful middle of C0 and is reused
-                # when C1 arrives.
-                launch_beta_chunk(1)
+                def make_pre_h_hook(j):
+                    def hook():
+                        # Launch beta(C_j) at the last legal point before
+                        # H(C_{j-1}) starts, so the side-stream work overlaps
+                        # the recurrent state kernel instead of earlier PRE.
+                        launch_beta_chunk(j)
+                    return hook
             else:
                 launch_beta_chunk = None
+                make_pre_h_hook = None
 
             for i in range(fsc):
                 sl = slice(i * chunk, (i + 1) * chunk)
-                if use_beta_lookahead and launch_beta_chunk is not None:
-                    launch_beta_chunk(i + 1)
                 o_i = self._stateful_middle(
                     q[:, sl].contiguous(),
                     k[:, sl].contiguous(),
@@ -739,6 +747,7 @@ class DeltaNetAttention(MegatronModule):
                     output_final_state=True,
                     precomputed_beta=beta_cache[i] if beta_cache is not None and i > 0 else None,
                     beta_ready_event=beta_events[i] if beta_events is not None and i > 0 else None,
+                    pre_h_hook=make_pre_h_hook(i + 1) if make_pre_h_hook is not None else None,
                 )
                 outs.append(o_i)
             # Clear transient cross-chunk state so that subsequent forward
