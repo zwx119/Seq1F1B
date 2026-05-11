@@ -672,12 +672,6 @@ def _add_deltanet_args(parser):
                        'C_i+1 arrives. This is a forward prototype; qkvg '
                        'linear gradients are restored with a custom autograd '
                        'wrapper.')
-    group.add_argument('--deltanet-fused-h-o-pipeline',
-                       action='store_true', default=False,
-                       help='Use the FLA internal H/O pipeline for DeltaNet '
-                       'chunk mode. This overlaps the recurrent H kernel with '
-                       'chunk_o work at the FLA BT=64 boundary without '
-                       'splitting DeltaNet chunks in Python.')
     group.add_argument('--deltanet-use-output-gate', action='store_true',
                        default=True,
                        help='Use an output gating mechanism. Default: True.')
