@@ -410,11 +410,11 @@ def validate_args(args, defaults={}):
                 '--deltanet-hybrid-attention-layers')
         # DeltaNet requires fla library
         try:
-            from fla.ops.delta_rule import chunk_delta_rule  # noqa: F401
-        except ImportError:
+            from fla.ops.delta_rule.chunk import chunk_delta_rule  # noqa: F401
+        except ImportError as exc:
             raise RuntimeError(
                 '--use-deltanet requires the flash-linear-attention (fla) '
-                'library. Install with: pip install flash-linear-attention')
+                'library. Install with: pip install flash-linear-attention') from exc
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple

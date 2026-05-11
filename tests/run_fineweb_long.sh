@@ -124,6 +124,9 @@ fi
 # setting (overrideable).
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export FLA_USE_FUSED_SOLVE_WU="${FLA_USE_FUSED_SOLVE_WU:-0}"
+FLA_DIR="${FLA_DIR:-${DIR}/flash-linear-attention}"
+export FLA_DIR
+export PYTHONPATH="${FLA_DIR}:${DIR}:${PYTHONPATH:-}"
 
 # ============================================================================
 # Sanity checks
@@ -176,6 +179,7 @@ if [ -n "${PIPE_SP_MANUAL_SPLITS}" ]; then
     echo "  manual_split = ${PIPE_SP_MANUAL_SPLITS}"
 fi
 echo "  fused_solve  = ${FLA_USE_FUSED_SOLVE_WU}"
+echo "  fla_dir      = ${FLA_DIR}"
 echo "  resume       = ${RESUME}"
 echo "  torchrun     = $([ "${TORCHRUN_STANDALONE}" = "1" ] && echo standalone || echo c10d)"
 if [ -n "${EXTRA_ARGS}" ]; then
