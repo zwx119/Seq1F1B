@@ -639,6 +639,14 @@ def _add_deltanet_args(parser):
                        'falls back to the normal synchronous beta path because '
                        'the next chunk activation is not available inside one '
                        'DeltaNetAttention forward.')
+    group.add_argument('--deltanet-fused-h-beta-precompute',
+                       action='store_true', default=False,
+                       help='In --force-seq-chunks mode, fuse DeltaNet '
+                       'H(C_i) with beta/b_proj(C_i+1) in one Triton launch '
+                       'and reuse the cached beta when C_i+1 arrives. This is '
+                       'an end-to-end prototype of same-layer next-chunk beta '
+                       'lookahead; gradients for b_proj are restored with a '
+                       'custom autograd wrapper.')
     group.add_argument('--deltanet-use-output-gate', action='store_true',
                        default=True,
                        help='Use an output gating mechanism. Default: True.')
