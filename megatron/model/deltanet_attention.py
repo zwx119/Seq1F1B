@@ -38,7 +38,11 @@ except ImportError:
 
 try:
     from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
-    from fla.ops.delta_rule.chunk import chunk_delta_rule_fwd, chunk_delta_rule_bwd
+    from fla.ops.delta_rule.chunk import (
+        chunk_delta_rule_bwd,
+        chunk_delta_rule_fwd,
+        chunk_delta_rule_fwd_beta_projection_pipeline,
+    )
     from fla.modules.conv.triton.ops import causal_conv1d_fwd, causal_conv1d_bwd
     from fla.modules.l2norm import l2norm_fwd, l2norm_bwd
     from fla.ops.utils.index import prepare_chunk_indices
@@ -243,6 +247,9 @@ class DeltaNetChunkFunc(torch.autograd.Function):
         fused_beta_out=None,
         fused_beta_apply_sigmoid=True,
         fused_beta_block_n=32,
+        beta_projection_x=None,
+        beta_projection_weight=None,
+        use_beta_projection_pipeline=False,
     ):
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
@@ -253,20 +260,34 @@ class DeltaNetChunkFunc(torch.autograd.Function):
         # Read initial_state from shared cache (NOT a tensor arg to .apply())
         initial_state = state_cache.get('recurrent_state', None)
 
-        o, A, final_state = chunk_delta_rule_fwd(
-            q=q, k=k, v=v, beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=None,
-            chunk_indices=None,
-            pre_h_hook=pre_h_hook,
-            fused_beta_x=fused_beta_x,
-            fused_beta_weight=fused_beta_weight,
-            fused_beta_out=fused_beta_out,
-            fused_beta_apply_sigmoid=fused_beta_apply_sigmoid,
-            fused_beta_block_n=fused_beta_block_n,
-        )
+        if use_beta_projection_pipeline:
+            o, A, final_state, beta = (
+                chunk_delta_rule_fwd_beta_projection_pipeline(
+                    q=q,
+                    k=k,
+                    v=v,
+                    beta_x=beta_projection_x,
+                    beta_weight=beta_projection_weight,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                )
+            )
+        else:
+            o, A, final_state = chunk_delta_rule_fwd(
+                q=q, k=k, v=v, beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=None,
+                chunk_indices=None,
+                pre_h_hook=pre_h_hook,
+                fused_beta_x=fused_beta_x,
+                fused_beta_weight=fused_beta_weight,
+                fused_beta_out=fused_beta_out,
+                fused_beta_apply_sigmoid=fused_beta_apply_sigmoid,
+                fused_beta_block_n=fused_beta_block_n,
+            )
 
         # Store final_state in cache for next chunk's forward
         state_cache['recurrent_state'] = final_state
@@ -274,33 +295,70 @@ class DeltaNetChunkFunc(torch.autograd.Function):
         # Save for backward. initial_state is a plain tensor (no grad_fn)
         # because it was created inside a previous DeltaNetChunkFunc.forward
         # where autograd doesn't track operations.
-        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, beta, A)
+        if use_beta_projection_pipeline:
+            ctx.save_for_backward(
+                q, q_rstd, k, k_rstd, v, beta, A,
+                beta_projection_x, beta_projection_weight,
+            )
+        else:
+            ctx.save_for_backward(q, q_rstd, k, k_rstd, v, beta, A)
         ctx._initial_state = initial_state  # may be None, can't use save_for_backward
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx._state_cache = state_cache
+        ctx.use_beta_projection_pipeline = use_beta_projection_pipeline
 
         return o.to(q.dtype)
 
     @staticmethod
     def backward(ctx, do):
-        q, q_rstd, k, k_rstd, v, beta, A = ctx.saved_tensors
-        initial_state = ctx._initial_state
         state_cache = ctx._state_cache
 
         # Retrieve dht from state_cache (stored by the next chunk's backward).
         # If absent, this is the last chunk (first to run backward), dht=None.
         dht = state_cache.pop('d_state', None)
 
-        dq, dk, dv, db, dh0 = chunk_delta_rule_bwd(
-            q=q, k=k, v=v, beta=beta, A=A,
-            scale=ctx.scale,
-            initial_state=initial_state,
-            do=do,
-            dht=dht,
-            cu_seqlens=None,
-            chunk_indices=None,
-        )
+        dbeta_x = None
+        dbeta_weight = None
+        if ctx.use_beta_projection_pipeline:
+            (
+                q, q_rstd, k, k_rstd, v, beta, A,
+                beta_projection_x, beta_projection_weight,
+            ) = ctx.saved_tensors
+            initial_state = ctx._initial_state
+            dq, dk, dv, db, dh0 = chunk_delta_rule_bwd(
+                q=q, k=k, v=v, beta=beta, A=A,
+                scale=ctx.scale,
+                initial_state=initial_state,
+                do=do,
+                dht=dht,
+                cu_seqlens=None,
+                chunk_indices=None,
+            )
+            grad_logits = db * beta * (1.0 - beta)
+            x_2d = beta_projection_x.reshape(-1, beta_projection_x.shape[-1])
+            grad_2d = grad_logits.reshape(-1, grad_logits.shape[-1])
+            dbeta_x = grad_2d.to(torch.float32).matmul(
+                beta_projection_weight.to(torch.float32)
+            )
+            dbeta_weight = grad_2d.to(torch.float32).t().matmul(
+                x_2d.to(torch.float32)
+            )
+            dbeta_x = dbeta_x.reshape_as(beta_projection_x).to(beta_projection_x.dtype)
+            dbeta_weight = dbeta_weight.to(beta_projection_weight.dtype)
+        else:
+            q, q_rstd, k, k_rstd, v, beta, A = ctx.saved_tensors
+            initial_state = ctx._initial_state
+
+            dq, dk, dv, db, dh0 = chunk_delta_rule_bwd(
+                q=q, k=k, v=v, beta=beta, A=A,
+                scale=ctx.scale,
+                initial_state=initial_state,
+                do=do,
+                dht=dht,
+                cu_seqlens=None,
+                chunk_indices=None,
+            )
 
         # Store dh0 for the previous chunk's backward
         if dh0 is not None:
@@ -310,11 +368,15 @@ class DeltaNetChunkFunc(torch.autograd.Function):
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
 
+        db_for_beta_arg = None if ctx.use_beta_projection_pipeline else db.to(beta.dtype)
+
         # grad for: q, k, v, beta, scale, state_cache, use_qk_l2norm,
         # pre_h_hook, fused_beta_x, fused_beta_weight, fused_beta_out,
-        # fused_beta_apply_sigmoid, fused_beta_block_n
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), \
-               None, None, None, None, None, None, None, None, None
+        # fused_beta_apply_sigmoid, fused_beta_block_n, beta_projection_x,
+        # beta_projection_weight, use_beta_projection_pipeline
+        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db_for_beta_arg, \
+               None, None, None, None, None, None, None, None, None, \
+               dbeta_x, dbeta_weight, None
 
 
 class DeltaNetAttention(MegatronModule):
@@ -623,9 +685,26 @@ class DeltaNetAttention(MegatronModule):
                 q = (F.elu(q, 1., False) + 1.).to(q)
                 k = (F.elu(k, 1., False) + 1.).to(k)
 
+        # ============ DeltaNet core mode ============
+        mode = 'fused_recurrent' if seq_len <= 64 else self.deltanet_mode
+
+        use_beta_projection_pipeline = (
+            self.use_beta
+            and mode == 'chunk'
+            and output_final_state
+            and self._should_fuse_h_beta_precompute()
+            and precomputed_beta is None
+            and beta_ready_event is None
+            and fused_beta_x is None
+            and fused_beta_weight is None
+            and fused_beta_out is None
+        )
+
         # ============ Beta ============
         if self.use_beta:
-            if precomputed_beta is not None:
+            if use_beta_projection_pipeline:
+                beta = None
+            elif precomputed_beta is not None:
                 if beta_ready_event is not None:
                     torch.cuda.current_stream(precomputed_beta.device).wait_event(beta_ready_event)
                 if precomputed_beta_fused:
@@ -643,7 +722,6 @@ class DeltaNetAttention(MegatronModule):
             )
 
         # ============ DeltaNet core computation ============
-        mode = 'fused_recurrent' if seq_len <= 64 else self.deltanet_mode
         initial_state = self.state_cache.get('recurrent_state', None)
 
         if output_final_state and mode == 'chunk':
@@ -655,7 +733,18 @@ class DeltaNetAttention(MegatronModule):
                 q = q.to(q_kv_dtype)
                 k = k.to(q_kv_dtype)
                 v = v.to(q_kv_dtype)
-                beta = beta.to(q_kv_dtype)
+                if beta is not None:
+                    beta = beta.to(q_kv_dtype)
+
+            beta_projection_x = None
+            beta_projection_weight = None
+            if use_beta_projection_pipeline:
+                beta_projection_x = hidden_states_bsh
+                beta_projection_weight = self.b_proj.weight
+                if beta_projection_weight.dtype != beta_projection_x.dtype:
+                    beta_projection_weight = beta_projection_weight.to(beta_projection_x.dtype)
+                if not beta_projection_weight.is_contiguous():
+                    beta_projection_weight = beta_projection_weight.contiguous()
 
             o = DeltaNetChunkFunc.apply(
                 q, k, v, beta,
@@ -668,6 +757,9 @@ class DeltaNetAttention(MegatronModule):
                 fused_beta_out,
                 fused_beta_apply_sigmoid,
                 fused_beta_block_n,
+                beta_projection_x,
+                beta_projection_weight,
+                use_beta_projection_pipeline,
             )
             if needs_cast:
                 o = o.to(orig_dtype)
