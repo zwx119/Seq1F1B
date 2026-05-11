@@ -404,6 +404,8 @@ def validate_args(args, defaults={}):
             raise RuntimeError('--deltanet-hybrid-attention-period must be >= 0')
         if getattr(args, 'deltanet_hybrid_attention_offset', 0) < 0:
             raise RuntimeError('--deltanet-hybrid-attention-offset must be >= 0')
+        if getattr(args, 'deltanet_internal_lookahead_chunks', 1) < 1:
+            raise RuntimeError('--deltanet-internal-lookahead-chunks must be >= 1')
         if getattr(args, 'deltanet_hybrid_attention_layers', '').strip():
             _parse_int_list_or_ranges(
                 args.deltanet_hybrid_attention_layers,
@@ -415,16 +417,20 @@ def validate_args(args, defaults={}):
                 '--deltanet-fused-h-qkvg-precompute both use the same fused H '
                 'projection slot; enable only one of them.')
         if (getattr(args, 'deltanet_overlap_beta_precompute', False)
-                or getattr(args, 'deltanet_fused_h_beta_precompute', False)
+                and getattr(args, 'force_seq_chunks', 1) <= 1):
+            raise RuntimeError(
+                '--deltanet-overlap-beta-precompute is only implemented for '
+                'the --force-seq-chunks verification path.')
+        if (getattr(args, 'deltanet_fused_h_beta_precompute', False)
                 or getattr(args, 'deltanet_fused_h_qkvg_precompute', False)):
-            if getattr(args, 'force_seq_chunks', 1) <= 1:
+            if (getattr(args, 'force_seq_chunks', 1) <= 1
+                    and getattr(args, 'deltanet_internal_lookahead_chunks', 1) <= 1):
                 raise RuntimeError(
-                    'DeltaNet beta/qkvg lookahead flags are currently only '
-                    'implemented for the --force-seq-chunks verification path. '
-                    'The attempted Python-level internal BT=64 implementation '
-                    'was disabled because it explodes kernel-launch overhead; '
-                    'a production internal-chunk version must be implemented '
-                    'inside the FLA PRE/H pipeline.')
+                    'DeltaNet fused beta/qkvg lookahead is enabled when either '
+                    '--force-seq-chunks > 1 or '
+                    '--deltanet-internal-lookahead-chunks > 1 is set. '
+                    'For real Seq1F1B end-to-end runs, prefer a small '
+                    '--deltanet-internal-lookahead-chunks value such as 2 or 4.')
         # DeltaNet requires fla library
         try:
             from fla.ops.delta_rule.chunk import chunk_delta_rule  # noqa: F401
@@ -672,6 +678,14 @@ def _add_deltanet_args(parser):
                        'C_i+1 arrives. This is a forward prototype; qkvg '
                        'linear gradients are restored with a custom autograd '
                        'wrapper.')
+    group.add_argument('--deltanet-internal-lookahead-chunks',
+                       type=int, default=1,
+                       help='Split each DeltaNetAttention forward span into '
+                       'this many internal subchunks for fused H + next '
+                       'beta/qkvg lookahead. This is independent of '
+                       '--force-seq-chunks and is intended for end-to-end '
+                       'Seq1F1B runs; keep small, e.g. 2 or 4, to avoid '
+                       'kernel-launch overhead.')
     group.add_argument('--deltanet-fused-h-o-pipeline',
                        action='store_true', default=False,
                        help='Use the FLA internal H/O pipeline for DeltaNet '
