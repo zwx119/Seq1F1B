@@ -630,12 +630,15 @@ def _add_deltanet_args(parser):
                        help='Disable learned beta, using fixed beta=1.')
     group.add_argument('--deltanet-overlap-beta-precompute',
                        action='store_true', default=False,
-                       help='Compute DeltaNet beta/b_proj on a side CUDA '
-                       'stream. In --force-seq-chunks mode this uses a '
-                       'one-chunk beta lookahead so beta(C_i+1) can overlap '
-                       'the current chunk core; in ordinary one-chunk forward '
-                       'it precomputes the current chunk beta before the '
-                       'delta-rule kernel. This does not split fused qkvg.')
+                       help='In --force-seq-chunks mode, compute DeltaNet '
+                       'beta/b_proj for chunk C_i+1 on a side CUDA stream '
+                       'while C_i runs, then reuse the cached beta when C_i+1 '
+                       'arrives. This is a verification/prototype path for '
+                       'same-layer next-chunk beta lookahead and does not '
+                       'split fused qkvg. Ordinary pipe-sp forward currently '
+                       'falls back to the normal synchronous beta path because '
+                       'the next chunk activation is not available inside one '
+                       'DeltaNetAttention forward.')
     group.add_argument('--deltanet-use-output-gate', action='store_true',
                        default=True,
                        help='Use an output gating mechanism. Default: True.')

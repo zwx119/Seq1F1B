@@ -443,11 +443,11 @@ class DeltaNetAttention(MegatronModule):
         )
 
     def _start_beta_precompute(self, hidden_states_bsh, wait_main_stream=True):
-        """Launch beta/b_proj on a side stream for the current chunk.
+        """Launch beta/b_proj for the provided chunk on a side stream.
 
-        This hides state-independent beta PRE work under q/k/v short-conv and
-        layout work in the same forward call. True C_i -> C_{i+1} lookahead
-        would require scheduler-level access to the next chunk's activations.
+        The caller owns the dependency story.  In the force-seq-chunks
+        verification path we call this for hidden(C_i+1) before running the
+        stateful middle of C_i, then reuse the cached beta when C_i+1 arrives.
         """
         if not self._should_overlap_beta_precompute() or not hidden_states_bsh.is_cuda:
             return None, None
@@ -716,13 +716,12 @@ class DeltaNetAttention(MegatronModule):
                         return
                     beta_cache[j], beta_events[j] = self._start_beta_precompute(
                         hidden_chunks[j],
-                        wait_main_stream=(j == 0),
+                        wait_main_stream=(j == 1),
                     )
 
-                # Prime the side-stream queue. Chunk 0 beta can overlap this
-                # chunk's short-conv/layout; chunk 1 beta can overlap chunk 0
-                # state/core once the side stream reaches it.
-                launch_beta_chunk(0)
+                # Prime one-chunk lookahead.  Chunk 0 computes beta normally;
+                # beta(C1) can overlap the stateful middle of C0 and is reused
+                # when C1 arrives.
                 launch_beta_chunk(1)
             else:
                 launch_beta_chunk = None
@@ -738,8 +737,8 @@ class DeltaNetAttention(MegatronModule):
                     hidden_chunks[i] if hidden_chunks is not None else hidden_states_bsh[:, sl].contiguous(),
                     use_conv_cache=(i > 0),
                     output_final_state=True,
-                    precomputed_beta=beta_cache[i] if beta_cache is not None else None,
-                    beta_ready_event=beta_events[i] if beta_events is not None else None,
+                    precomputed_beta=beta_cache[i] if beta_cache is not None and i > 0 else None,
+                    beta_ready_event=beta_events[i] if beta_events is not None and i > 0 else None,
                 )
                 outs.append(o_i)
             # Clear transient cross-chunk state so that subsequent forward
@@ -752,13 +751,10 @@ class DeltaNetAttention(MegatronModule):
             use_conv_cache = (args.pipe_sp_splits > 1 and micro_sp_idx is not None
                               and micro_sp_idx > 0)
             output_final_state = (args.pipe_sp_splits > 1)
-            beta, beta_ready = self._start_beta_precompute(hidden_states_bsh)
             o = self._stateful_middle(
                 q, k, v, hidden_states_bsh,
                 use_conv_cache=use_conv_cache,
                 output_final_state=output_final_state,
-                precomputed_beta=beta,
-                beta_ready_event=beta_ready,
             )
 
         # ============ Output normalization & gate ============
