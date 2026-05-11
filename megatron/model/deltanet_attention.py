@@ -485,8 +485,8 @@ class DeltaNetAttention(MegatronModule):
           hidden_states_bsh:   [b, s, h]                            (for b_proj)
           use_conv_cache:      bool — read self.conv_state_{q,k,v} as initial conv state
           output_final_state:  bool — update self.conv_state_{q,k,v} and self.state_cache
-          pre_h_hook:          optional callback launched after local PRE/beta,
-                               immediately before the DeltaNet state kernel
+          pre_h_hook:          optional callback launched from the FLA chunk
+                               path right after the state kernel is enqueued
 
         Output:
           o: [b, s, num_heads_per_partition, head_dim]
@@ -727,9 +727,9 @@ class DeltaNetAttention(MegatronModule):
 
                 def make_pre_h_hook(j):
                     def hook():
-                        # Launch beta(C_j) at the last legal point before
-                        # H(C_{j-1}) starts, so the side-stream work overlaps
-                        # the recurrent state kernel instead of earlier PRE.
+                        # Launch beta(C_j) from the FLA chunk path immediately
+                        # after H(C_{j-1}) is enqueued, so side-stream work
+                        # targets the recurrent state kernel instead of PRE.
                         launch_beta_chunk(j)
                     return hook
             else:
