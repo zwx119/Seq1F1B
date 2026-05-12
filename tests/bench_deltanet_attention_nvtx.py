@@ -119,6 +119,8 @@ def run(cli: argparse.Namespace) -> None:
 
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        if cli.cuda_profiler_range:
+            torch.cuda.cudart().cudaProfilerStart()
         torch.cuda.nvtx.range_push(f"bench.{cli.mode}.measured")
         start.record()
         for i in range(cli.iters):
@@ -126,6 +128,8 @@ def run(cli: argparse.Namespace) -> None:
         end.record()
         end.synchronize()
         torch.cuda.nvtx.range_pop()
+        if cli.cuda_profiler_range:
+            torch.cuda.cudart().cudaProfilerStop()
 
     avg_ms = start.elapsed_time(end) / cli.iters
     print(
@@ -151,6 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--check-finite", action="store_true")
+    parser.add_argument("--cuda-profiler-range", action="store_true")
     return parser.parse_args()
 
 
