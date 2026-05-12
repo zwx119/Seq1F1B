@@ -19,7 +19,9 @@ Key design decisions:
     to how Megatron splits attention heads.
 """
 
+import contextlib
 import math
+import os
 import warnings
 from typing import Optional
 
@@ -61,6 +63,67 @@ try:
     HAS_FLA_MODULES = True
 except ImportError:
     HAS_FLA_MODULES = False
+
+
+_DELTANET_TIMING_STATS = {}
+
+
+def _deltanet_profile_enabled():
+    return (
+        os.environ.get("DELTANET_ATTN_NVTX", "0") != "0"
+        or os.environ.get("DELTANET_ATTN_CUDA_TIMING", "0") != "0"
+    ) and torch.cuda.is_available()
+
+
+def _deltanet_profile_start(name):
+    if not _deltanet_profile_enabled():
+        return None
+    use_nvtx = os.environ.get("DELTANET_ATTN_NVTX", "0") != "0"
+    use_timing = os.environ.get("DELTANET_ATTN_CUDA_TIMING", "0") != "0"
+    if use_nvtx:
+        torch.cuda.nvtx.range_push(name)
+    start_event = end_event = None
+    if use_timing:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    return name, use_nvtx, start_event, end_event
+
+
+def _deltanet_profile_end(token):
+    if token is None:
+        return
+    name, use_nvtx, start_event, end_event = token
+    if end_event is not None:
+        end_event.record()
+        end_event.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)
+        total_ms, count = _DELTANET_TIMING_STATS.get(name, (0.0, 0))
+        total_ms += elapsed_ms
+        count += 1
+        _DELTANET_TIMING_STATS[name] = (total_ms, count)
+        interval = int(os.environ.get("DELTANET_ATTN_TIMING_INTERVAL", "100"))
+        if interval > 0 and count % interval == 0:
+            try:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            except Exception:
+                rank = 0
+            print(
+                f"[rank {rank}] {name}: last={elapsed_ms:.3f} ms "
+                f"avg={total_ms / count:.3f} ms count={count}",
+                flush=True,
+            )
+    if use_nvtx:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextlib.contextmanager
+def _deltanet_profile(name):
+    token = _deltanet_profile_start(name)
+    try:
+        yield
+    finally:
+        _deltanet_profile_end(token)
 
 
 # ============================================================================
@@ -465,39 +528,41 @@ class DeltaNetAttention(MegatronModule):
         Output:
           o: [b, s, num_heads_per_partition, head_dim]
         """
+        profile_token = _deltanet_profile_start("DeltaNetAttention.stateful_middle")
         args = get_args()
         batch_size, seq_len, _ = hidden_states_bsh.shape
 
         # ============ Short Convolutions ============
-        if self.use_short_conv:
-            # Activation name per conv (q/k driven by qk_activation, v always silu)
-            qk_act = 'silu' if self.qk_activation == 'silu' else None
-            if output_final_state:
-                # Chunked / stateful Seq1F1B path: use ShortConvChunkFunc so
-                # gradient correctly relays across chunk boundaries (no detach).
-                q = ShortConvChunkFunc.apply(
-                    q, self.q_conv1d.weight, self.q_conv1d.bias,
-                    self.conv_cache_dict, self.conv_grad_dict, 'q', qk_act,
-                )
-                k = ShortConvChunkFunc.apply(
-                    k, self.k_conv1d.weight, self.k_conv1d.bias,
-                    self.conv_cache_dict, self.conv_grad_dict, 'k', qk_act,
-                )
-                v = ShortConvChunkFunc.apply(
-                    v, self.v_conv1d.weight, self.v_conv1d.bias,
-                    self.conv_cache_dict, self.conv_grad_dict, 'v', 'silu',
-                )
+        with _deltanet_profile("DeltaNetAttention.short_conv_or_activation"):
+            if self.use_short_conv:
+                # Activation name per conv (q/k driven by qk_activation, v always silu)
+                qk_act = 'silu' if self.qk_activation == 'silu' else None
+                if output_final_state:
+                    # Chunked / stateful Seq1F1B path: use ShortConvChunkFunc so
+                    # gradient correctly relays across chunk boundaries (no detach).
+                    q = ShortConvChunkFunc.apply(
+                        q, self.q_conv1d.weight, self.q_conv1d.bias,
+                        self.conv_cache_dict, self.conv_grad_dict, 'q', qk_act,
+                    )
+                    k = ShortConvChunkFunc.apply(
+                        k, self.k_conv1d.weight, self.k_conv1d.bias,
+                        self.conv_cache_dict, self.conv_grad_dict, 'k', qk_act,
+                    )
+                    v = ShortConvChunkFunc.apply(
+                        v, self.v_conv1d.weight, self.v_conv1d.bias,
+                        self.conv_cache_dict, self.conv_grad_dict, 'v', 'silu',
+                    )
+                else:
+                    # Non-chunked (SP=1 + no force-seq-chunks) — use fla's fused
+                    # kernel for speed; there is no cross-chunk gradient to relay.
+                    q, _ = self.q_conv1d(x=q, cache=None, output_final_state=False)
+                    k, _ = self.k_conv1d(x=k, cache=None, output_final_state=False)
+                    v, _ = self.v_conv1d(x=v, cache=None, output_final_state=False)
             else:
-                # Non-chunked (SP=1 + no force-seq-chunks) — use fla's fused
-                # kernel for speed; there is no cross-chunk gradient to relay.
-                q, _ = self.q_conv1d(x=q, cache=None, output_final_state=False)
-                k, _ = self.k_conv1d(x=k, cache=None, output_final_state=False)
-                v, _ = self.v_conv1d(x=v, cache=None, output_final_state=False)
-        else:
-            # Without short conv, apply activation directly
-            if self.qk_activation == 'silu':
-                q, k = F.silu(q), F.silu(k)
-            v = F.silu(v)
+                # Without short conv, apply activation directly
+                if self.qk_activation == 'silu':
+                    q, k = F.silu(q), F.silu(k)
+                v = F.silu(v)
 
         # ============ Reshape to multi-head ============
         q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
@@ -521,73 +586,76 @@ class DeltaNetAttention(MegatronModule):
         )
 
         # ============ Beta ============
-        if self.use_beta:
-            beta = self.b_proj(hidden_states_bsh).sigmoid()
-        else:
-            beta = torch.ones(
-                batch_size, seq_len, self.num_attention_heads_per_partition,
-                device=hidden_states_bsh.device, dtype=hidden_states_bsh.dtype
-            )
+        with _deltanet_profile("DeltaNetAttention.beta"):
+            if self.use_beta:
+                beta = self.b_proj(hidden_states_bsh).sigmoid()
+            else:
+                beta = torch.ones(
+                    batch_size, seq_len, self.num_attention_heads_per_partition,
+                    device=hidden_states_bsh.device, dtype=hidden_states_bsh.dtype
+                )
 
         # ============ DeltaNet core computation ============
         initial_state = self.state_cache.get('recurrent_state', None)
 
-        if output_final_state and mode == 'chunk':
-            # Seq1F1B path: use DeltaNetChunkFunc with backward state gradient relay.
-            orig_dtype = q.dtype
-            needs_cast = (orig_dtype == torch.float32)
-            if needs_cast:
-                q_kv_dtype = torch.bfloat16
-                q = q.to(q_kv_dtype)
-                k = k.to(q_kv_dtype)
-                v = v.to(q_kv_dtype)
-                if beta is not None:
+        with _deltanet_profile("DeltaNetAttention.delta_rule_core"):
+            if output_final_state and mode == 'chunk':
+                # Seq1F1B path: use DeltaNetChunkFunc with backward state gradient relay.
+                orig_dtype = q.dtype
+                needs_cast = (orig_dtype == torch.float32)
+                if needs_cast:
+                    q_kv_dtype = torch.bfloat16
+                    q = q.to(q_kv_dtype)
+                    k = k.to(q_kv_dtype)
+                    v = v.to(q_kv_dtype)
+                    if beta is not None:
+                        beta = beta.to(q_kv_dtype)
+
+                o = DeltaNetChunkFunc.apply(
+                    q, k, v, beta,
+                    self.head_dim ** -0.5,
+                    self.state_cache,
+                    (self.qk_norm == 'l2'),
+                    use_ho_pipeline,
+                )
+                if needs_cast:
+                    o = o.to(orig_dtype)
+            elif mode == 'fused_recurrent':
+                o, recurrent_state = fused_recurrent_delta_rule(
+                    q=q, k=k, v=v, beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
+                )
+                if output_final_state and recurrent_state is not None:
+                    self.state_cache['recurrent_state'] = recurrent_state.detach()
+            elif mode == 'chunk':
+                orig_dtype = q.dtype
+                needs_cast = (orig_dtype == torch.float32)
+                if needs_cast:
+                    q_kv_dtype = torch.bfloat16
+                    q = q.to(q_kv_dtype)
+                    k = k.to(q_kv_dtype)
+                    v = v.to(q_kv_dtype)
                     beta = beta.to(q_kv_dtype)
 
-            o = DeltaNetChunkFunc.apply(
-                q, k, v, beta,
-                self.head_dim ** -0.5,
-                self.state_cache,
-                (self.qk_norm == 'l2'),
-                use_ho_pipeline,
-            )
-            if needs_cast:
-                o = o.to(orig_dtype)
-        elif mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_delta_rule(
-                q=q, k=k, v=v, beta=beta,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
-            )
-            if output_final_state and recurrent_state is not None:
-                self.state_cache['recurrent_state'] = recurrent_state.detach()
-        elif mode == 'chunk':
-            orig_dtype = q.dtype
-            needs_cast = (orig_dtype == torch.float32)
-            if needs_cast:
-                q_kv_dtype = torch.bfloat16
-                q = q.to(q_kv_dtype)
-                k = k.to(q_kv_dtype)
-                v = v.to(q_kv_dtype)
-                beta = beta.to(q_kv_dtype)
+                o, recurrent_state = chunk_delta_rule(
+                    q=q, k=k, v=v, beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
+                )
+                if needs_cast:
+                    o = o.to(orig_dtype)
+                    if recurrent_state is not None:
+                        try:
+                            recurrent_state = recurrent_state.to(orig_dtype)
+                        except Exception:
+                            pass
+            else:
+                raise NotImplementedError(f"DeltaNet mode `{mode}` not supported.")
 
-            o, recurrent_state = chunk_delta_rule(
-                q=q, k=k, v=v, beta=beta,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
-            )
-            if needs_cast:
-                o = o.to(orig_dtype)
-                if recurrent_state is not None:
-                    try:
-                        recurrent_state = recurrent_state.to(orig_dtype)
-                    except Exception:
-                        pass
-        else:
-            raise NotImplementedError(f"DeltaNet mode `{mode}` not supported.")
-
+        _deltanet_profile_end(profile_token)
         return o
 
     def forward(
@@ -609,6 +677,7 @@ class DeltaNetAttention(MegatronModule):
           - micro_sp_idx == 0: clear states, start fresh
           - micro_sp_idx > 0: use cached recurrent_state and conv_state
         """
+        profile_token = _deltanet_profile_start("DeltaNetAttention.forward")
         args = get_args()
         fsc = getattr(args, 'force_seq_chunks', 1)
 
@@ -627,35 +696,38 @@ class DeltaNetAttention(MegatronModule):
 
         # ============ Projections (keep [s, b, h] for ColumnParallelLinear) ============
         # ColumnParallelLinear: [s(/tp), b, h] -> all-gather dim-0 -> [s, b, h] -> matmul -> [s, b, h/tp]
-        if self.use_gate:
-            qkvg, _ = self.qkvg_proj(hidden_states)
-            q, k, v, g = torch.chunk(qkvg, 4, dim=-1)
-        elif not self.use_gate:
-            q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
-            k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
-            v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
-            g = None
+        with _deltanet_profile("DeltaNetAttention.qkv_proj"):
+            if self.use_gate:
+                qkvg, _ = self.qkvg_proj(hidden_states)
+                q, k, v, g = torch.chunk(qkvg, 4, dim=-1)
+            elif not self.use_gate:
+                q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
+                k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
+                v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
+                g = None
 
         # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
-        q = q.transpose(0, 1).contiguous()
-        k = k.transpose(0, 1).contiguous()
-        v = v.transpose(0, 1).contiguous()
-        if g is not None:
-            g = g.transpose(0, 1).contiguous()
+        with _deltanet_profile("DeltaNetAttention.input_layout"):
+            q = q.transpose(0, 1).contiguous()
+            k = k.transpose(0, 1).contiguous()
+            v = v.transpose(0, 1).contiguous()
+            if g is not None:
+                g = g.transpose(0, 1).contiguous()
 
         # Also prepare hidden_states for b_proj (nn.Linear, no internal all-gather).
         # When sequence_parallel=True, hidden_states is [s/tp, b, h], but
         # b_proj needs full seq_len to match q/k/v (which were all-gathered by ColumnParallelLinear).
-        if self.use_beta and self.sequence_parallel and mpu.get_tensor_model_parallel_world_size() > 1:
-            # All-gather hidden_states along dim-0 to get full seq for b_proj
-            hidden_states_full = tensor_parallel.gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=True
-            )
-            # [s, b, h] -> [b, s, h]
-            hidden_states_bsh = hidden_states_full.transpose(0, 1).contiguous()
-        else:
-            # [s, b, h] -> [b, s, h]
-            hidden_states_bsh = hidden_states.transpose(0, 1).contiguous()
+        with _deltanet_profile("DeltaNetAttention.beta_input_layout"):
+            if self.use_beta and self.sequence_parallel and mpu.get_tensor_model_parallel_world_size() > 1:
+                # All-gather hidden_states along dim-0 to get full seq for b_proj
+                hidden_states_full = tensor_parallel.gather_from_sequence_parallel_region(
+                    hidden_states, tensor_parallel_output_grad=True
+                )
+                # [s, b, h] -> [b, s, h]
+                hidden_states_bsh = hidden_states_full.transpose(0, 1).contiguous()
+            else:
+                # [s, b, h] -> [b, s, h]
+                hidden_states_bsh = hidden_states.transpose(0, 1).contiguous()
         batch_size, seq_len, _ = hidden_states_bsh.shape
 
         # ============ Optional force-seq-chunks mode (for verification) ============
@@ -710,24 +782,27 @@ class DeltaNetAttention(MegatronModule):
             )
 
         # ============ Output normalization & gate ============
-        if self.use_gate:
-            g = rearrange(g, 'b s (h d) -> b s h d', d=self.head_dim)
-            o = self.o_norm(o, g)
-        else:
-            o = self.o_norm(o)
+        with _deltanet_profile("DeltaNetAttention.output_norm"):
+            if self.use_gate:
+                g = rearrange(g, 'b s (h d) -> b s h d', d=self.head_dim)
+                o = self.o_norm(o, g)
+            else:
+                o = self.o_norm(o)
 
         # ============ Reshape and output projection ============
         # [b, s, num_heads_per_partition, head_dim] -> [b, s, hidden_per_partition]
-        o = rearrange(o, 'b s h d -> b s (h d)')
+        with _deltanet_profile("DeltaNetAttention.output_proj"):
+            o = rearrange(o, 'b s h d -> b s (h d)')
 
-        # RowParallelLinear expects [s, b, h/tp] format for correct reduce-scatter along dim-0
-        o = o.transpose(0, 1).contiguous()  # [b, s, h/tp] -> [s, b, h/tp]
+            # RowParallelLinear expects [s, b, h/tp] format for correct reduce-scatter along dim-0
+            o = o.transpose(0, 1).contiguous()  # [b, s, h/tp] -> [s, b, h/tp]
 
-        # RowParallelLinear: matmul + reduce-scatter -> [s/tp, b, h] (when sequence_parallel)
-        # or matmul + all-reduce -> [s, b, h] (when not sequence_parallel)
-        output, bias = self.o_proj(o)
+            # RowParallelLinear: matmul + reduce-scatter -> [s/tp, b, h] (when sequence_parallel)
+            # or matmul + all-reduce -> [s, b, h] (when not sequence_parallel)
+            output, bias = self.o_proj(o)
         if bias is not None:
             # bias is [h], needs to be compatible with [s, b, h]
             pass
 
+        _deltanet_profile_end(profile_token)
         return output, bias
