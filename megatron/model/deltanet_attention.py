@@ -98,10 +98,13 @@ def _deltanet_profile_end(token):
         end_event.record()
         end_event.synchronize()
         elapsed_ms = start_event.elapsed_time(end_event)
-        total_ms, count = _DELTANET_TIMING_STATS.get(name, (0.0, 0))
+        total_ms, count, window_ms, window_count = _DELTANET_TIMING_STATS.get(
+            name, (0.0, 0, 0.0, 0)
+        )
         total_ms += elapsed_ms
         count += 1
-        _DELTANET_TIMING_STATS[name] = (total_ms, count)
+        window_ms += elapsed_ms
+        window_count += 1
         interval = int(os.environ.get("DELTANET_ATTN_TIMING_INTERVAL", "100"))
         if interval > 0 and count % interval == 0:
             try:
@@ -110,9 +113,13 @@ def _deltanet_profile_end(token):
                 rank = 0
             print(
                 f"[rank {rank}] {name}: last={elapsed_ms:.3f} ms "
-                f"avg={total_ms / count:.3f} ms count={count}",
+                f"window_avg={window_ms / max(window_count, 1):.3f} ms "
+                f"global_avg={total_ms / count:.3f} ms count={count}",
                 flush=True,
             )
+            window_ms = 0.0
+            window_count = 0
+        _DELTANET_TIMING_STATS[name] = (total_ms, count, window_ms, window_count)
     if use_nvtx:
         torch.cuda.nvtx.range_pop()
 
