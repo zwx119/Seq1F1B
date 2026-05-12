@@ -88,11 +88,12 @@ def run(cli: argparse.Namespace) -> None:
 
     set_args(build_args(cli))
     config = build_config(cli)
+    dtype = torch.bfloat16 if cli.dtype == "bf16" else torch.float16
     model = DeltaNetAttention(config, layer_number=1).cuda()
     init_weights(model, cli.init_std)
+    model.to(dtype=dtype)
     model.eval()
 
-    dtype = torch.bfloat16 if cli.dtype == "bf16" else torch.float16
     hidden = torch.randn(
         cli.seq_len,
         cli.batch_size,
