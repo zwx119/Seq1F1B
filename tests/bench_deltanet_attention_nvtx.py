@@ -37,7 +37,7 @@ def build_args(cli: argparse.Namespace) -> SimpleNamespace:
         deltanet_qk_activation="silu",
         deltanet_qk_norm="l2",
         deltanet_use_beta=True,
-        deltanet_use_output_gate=False,
+        deltanet_use_output_gate=cli.use_output_gate,
         deltanet_use_short_conv=True,
         force_seq_chunks=1,
         pipe_sp_splits=cli.pipe_sp_splits,
@@ -135,7 +135,9 @@ def run(cli: argparse.Namespace) -> None:
     avg_ms = start.elapsed_time(end) / cli.iters
     print(
         f"mode={cli.mode} seq_len={cli.seq_len} batch={cli.batch_size} "
-        f"hidden={cli.hidden} heads={cli.heads} avg_forward_wall={avg_ms:.3f} ms",
+        f"hidden={cli.hidden} heads={cli.heads} "
+        f"use_output_gate={cli.use_output_gate} "
+        f"avg_forward_wall={avg_ms:.3f} ms",
         flush=True,
     )
 
@@ -147,6 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--hidden", type=int, default=2560)
     parser.add_argument("--heads", type=int, default=32)
+    parser.add_argument("--use-output-gate", action="store_true")
     parser.add_argument("--pipe-sp-splits", type=int, default=4)
     parser.add_argument("--conv-size", type=int, default=4)
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
