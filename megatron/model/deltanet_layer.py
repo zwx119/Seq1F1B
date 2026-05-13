@@ -16,7 +16,8 @@ The layer takes [s, b, h] input and returns [s, b, h] output, fully
 compatible with the existing ParallelTransformer container.
 """
 
-from contextlib import nullcontext
+import os
+from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import torch
@@ -35,6 +36,25 @@ from megatron.model.transformer import (
     DropPath,
 )
 from megatron.model.deltanet_attention import DeltaNetAttention
+
+
+def _deltanet_layer_nvtx_enabled():
+    return (
+        os.environ.get("DELTANET_LAYER_NVTX", "0") != "0"
+        or os.environ.get("DELTANET_ATTN_NVTX", "0") != "0"
+    ) and torch.cuda.is_available()
+
+
+@contextmanager
+def _deltanet_layer_nvtx(name):
+    if not _deltanet_layer_nvtx_enabled():
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class DeltaNetTransformerLayer(MegatronModule):
@@ -128,12 +148,13 @@ class DeltaNetTransformerLayer(MegatronModule):
         layernorm_output = self.input_layernorm(hidden_states)
 
         # DeltaNet self attention
-        attention_output, attention_bias = self.self_attention(
-            layernorm_output,
-            attention_mask,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-            micro_sp_idx=micro_sp_idx)
+        with _deltanet_layer_nvtx("DeltaNetLayer.attention"):
+            attention_output, attention_bias = self.self_attention(
+                layernorm_output,
+                attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                micro_sp_idx=micro_sp_idx)
 
         # Residual connection
         if self.apply_residual_connection_post_layernorm:
@@ -169,7 +190,8 @@ class DeltaNetTransformerLayer(MegatronModule):
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
         # MLP
-        mlp_output, mlp_bias = self.mlp(layernorm_output)
+        with _deltanet_layer_nvtx("DeltaNetLayer.mlp"):
+            mlp_output, mlp_bias = self.mlp(layernorm_output)
 
         # Second residual connection
         if self.apply_residual_connection_post_layernorm:
