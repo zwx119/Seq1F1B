@@ -651,6 +651,7 @@ class DeltaNetAttention(MegatronModule):
                     initial_state=initial_state,
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=(self.qk_norm == 'l2'),
+                    use_ho_pipeline=use_ho_pipeline,
                 )
                 if needs_cast:
                     o = o.to(orig_dtype)
