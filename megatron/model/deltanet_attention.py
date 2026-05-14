@@ -500,6 +500,7 @@ class DeltaNetAttention(MegatronModule):
         self.conv_state_q = None
         self.conv_state_k = None
         self.conv_state_v = None
+        self._qkvg_lookahead_stream = None
 
     def _clear_states(self):
         """Clear all cached states. Called when micro_sp_idx == 0."""
@@ -688,6 +689,11 @@ class DeltaNetAttention(MegatronModule):
         profile_token = _deltanet_profile_start("DeltaNetAttention.forward")
         args = get_args()
         fsc = getattr(args, 'force_seq_chunks', 1)
+        use_force_chunks = (
+            args.pipe_sp_splits == 1
+            and fsc > 1
+            and (micro_sp_idx is None or micro_sp_idx == 0)
+        )
 
         # Handle micro_sp_idx
         if micro_sp_idx is not None:
@@ -702,25 +708,50 @@ class DeltaNetAttention(MegatronModule):
         # all-gather along dim-0 (the seq dimension). So we must NOT
         # transpose before calling the projections.
 
-        # ============ Projections (keep [s, b, h] for ColumnParallelLinear) ============
-        # ColumnParallelLinear: [s(/tp), b, h] -> all-gather dim-0 -> [s, b, h] -> matmul -> [s, b, h/tp]
-        with _deltanet_profile("DeltaNetAttention.qkv_proj"):
-            if self.use_gate:
-                qkvg, _ = self.qkvg_proj(hidden_states)
-                q, k, v, g = torch.chunk(qkvg, 4, dim=-1)
-            elif not self.use_gate:
-                q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
-                k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
-                v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
-                g = None
+        qkvg_chunked = (
+            use_force_chunks
+            and self.use_gate
+            and torch.cuda.is_available()
+            and (
+                os.environ.get("DELTANET_QKVG_CHUNKED", "0") != "0"
+                or os.environ.get("DELTANET_QKVG_LOOKAHEAD", "0") != "0"
+            )
+            # The first implementation is a diagnostic for the single-rank
+            # force-chunk path. Real SP+TP lookahead needs a schedule-level
+            # cache because the next chunk's per-layer hidden state is not
+            # available inside this attention call.
+            and not (
+                self.sequence_parallel
+                and mpu.get_tensor_model_parallel_world_size() > 1
+            )
+        )
+        qkvg_lookahead = (
+            qkvg_chunked
+            and os.environ.get("DELTANET_QKVG_LOOKAHEAD", "0") != "0"
+        )
 
-        # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
-        with _deltanet_profile("DeltaNetAttention.input_layout"):
-            q = q.transpose(0, 1).contiguous()
-            k = k.transpose(0, 1).contiguous()
-            v = v.transpose(0, 1).contiguous()
-            if g is not None:
-                g = g.transpose(0, 1).contiguous()
+        if not qkvg_chunked:
+            # ============ Projections (keep [s, b, h] for ColumnParallelLinear) ============
+            # ColumnParallelLinear: [s(/tp), b, h] -> all-gather dim-0 -> [s, b, h] -> matmul -> [s, b, h/tp]
+            with _deltanet_profile("DeltaNetAttention.qkv_proj"):
+                if self.use_gate:
+                    qkvg, _ = self.qkvg_proj(hidden_states)
+                    q, k, v, g = torch.chunk(qkvg, 4, dim=-1)
+                elif not self.use_gate:
+                    q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
+                    k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
+                    v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
+                    g = None
+
+            # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
+            with _deltanet_profile("DeltaNetAttention.input_layout"):
+                q = q.transpose(0, 1).contiguous()
+                k = k.transpose(0, 1).contiguous()
+                v = v.transpose(0, 1).contiguous()
+                if g is not None:
+                    g = g.transpose(0, 1).contiguous()
+        else:
+            q = k = v = g = None
 
         # Also prepare hidden_states for b_proj (nn.Linear, no internal all-gather).
         # When sequence_parallel=True, hidden_states is [s/tp, b, h], but
@@ -747,11 +778,6 @@ class DeltaNetAttention(MegatronModule):
         # from all other system-level sources of fp noise, so that a bit-level
         # (fp32) diff between SP=1 and SP=1+force-seq-chunks=N proves Seq1F1B's
         # DeltaNet integration is algorithmically correct.
-        use_force_chunks = (
-            args.pipe_sp_splits == 1
-            and fsc > 1
-            and (micro_sp_idx is None or micro_sp_idx == 0)
-        )
         if use_force_chunks:
             assert seq_len % fsc == 0, (
                 f"seq_len {seq_len} must be divisible by "
@@ -762,17 +788,96 @@ class DeltaNetAttention(MegatronModule):
             chunk = seq_len // fsc
             outs = []
 
-            for i in range(fsc):
-                sl = slice(i * chunk, (i + 1) * chunk)
-                o_i = self._stateful_middle(
-                    q[:, sl].contiguous(),
-                    k[:, sl].contiguous(),
-                    v[:, sl].contiguous(),
-                    hidden_states_bsh[:, sl].contiguous(),
-                    use_conv_cache=(i > 0),
-                    output_final_state=True,
-                )
-                outs.append(o_i)
+            if qkvg_lookahead:
+                if self._qkvg_lookahead_stream is None:
+                    self._qkvg_lookahead_stream = torch.cuda.Stream()
+                qkvg_stream = self._qkvg_lookahead_stream
+                current_stream = torch.cuda.current_stream()
+                qkvg_stream.wait_stream(current_stream)
+                qkvg_cache = {}
+                qkvg_events = {}
+                g_chunks = []
+                use_nvtx = os.environ.get("DELTANET_ATTN_NVTX", "0") != "0"
+
+                def launch_qkvg(chunk_idx):
+                    sl_i = slice(chunk_idx * chunk, (chunk_idx + 1) * chunk)
+                    hidden_i = hidden_states[sl_i]
+                    hidden_i.record_stream(qkvg_stream)
+                    with torch.cuda.stream(qkvg_stream):
+                        if use_nvtx:
+                            torch.cuda.nvtx.range_push(
+                                f"DeltaNetAttention.qkv_proj.lookahead_{chunk_idx}"
+                            )
+                        try:
+                            qkvg_i, _ = self.qkvg_proj(hidden_i)
+                        finally:
+                            if use_nvtx:
+                                torch.cuda.nvtx.range_pop()
+                        event_i = torch.cuda.Event()
+                        event_i.record(qkvg_stream)
+                    qkvg_cache[chunk_idx] = qkvg_i
+                    qkvg_events[chunk_idx] = event_i
+
+                launch_qkvg(0)
+                for i in range(fsc):
+                    sl = slice(i * chunk, (i + 1) * chunk)
+                    current_stream.wait_event(qkvg_events.pop(i))
+                    qkvg_i = qkvg_cache.pop(i)
+                    qkvg_i.record_stream(current_stream)
+                    with _deltanet_profile("DeltaNetAttention.input_layout"):
+                        q_i, k_i, v_i, g_i = torch.chunk(qkvg_i, 4, dim=-1)
+                        q_i = q_i.transpose(0, 1).contiguous()
+                        k_i = k_i.transpose(0, 1).contiguous()
+                        v_i = v_i.transpose(0, 1).contiguous()
+                        g_i = g_i.transpose(0, 1).contiguous()
+                    if i + 1 < fsc:
+                        launch_qkvg(i + 1)
+                    o_i = self._stateful_middle(
+                        q_i,
+                        k_i,
+                        v_i,
+                        hidden_states_bsh[:, sl].contiguous(),
+                        use_conv_cache=(i > 0),
+                        output_final_state=True,
+                    )
+                    outs.append(o_i)
+                    g_chunks.append(g_i)
+                g = torch.cat(g_chunks, dim=1)
+            elif qkvg_chunked:
+                g_chunks = []
+                for i in range(fsc):
+                    sl = slice(i * chunk, (i + 1) * chunk)
+                    with _deltanet_profile("DeltaNetAttention.qkv_proj"):
+                        qkvg_i, _ = self.qkvg_proj(hidden_states[sl])
+                    with _deltanet_profile("DeltaNetAttention.input_layout"):
+                        q_i, k_i, v_i, g_i = torch.chunk(qkvg_i, 4, dim=-1)
+                        q_i = q_i.transpose(0, 1).contiguous()
+                        k_i = k_i.transpose(0, 1).contiguous()
+                        v_i = v_i.transpose(0, 1).contiguous()
+                        g_i = g_i.transpose(0, 1).contiguous()
+                    o_i = self._stateful_middle(
+                        q_i,
+                        k_i,
+                        v_i,
+                        hidden_states_bsh[:, sl].contiguous(),
+                        use_conv_cache=(i > 0),
+                        output_final_state=True,
+                    )
+                    outs.append(o_i)
+                    g_chunks.append(g_i)
+                g = torch.cat(g_chunks, dim=1)
+            else:
+                for i in range(fsc):
+                    sl = slice(i * chunk, (i + 1) * chunk)
+                    o_i = self._stateful_middle(
+                        q[:, sl].contiguous(),
+                        k[:, sl].contiguous(),
+                        v[:, sl].contiguous(),
+                        hidden_states_bsh[:, sl].contiguous(),
+                        use_conv_cache=(i > 0),
+                        output_final_state=True,
+                    )
+                    outs.append(o_i)
             # Clear transient cross-chunk state so that subsequent forward
             # calls in the same training iteration (e.g. microbatch 2, 3, …)
             # start fresh — matching the SP=1 baseline behaviour.

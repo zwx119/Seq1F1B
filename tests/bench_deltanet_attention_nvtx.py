@@ -39,7 +39,7 @@ def build_args(cli: argparse.Namespace) -> SimpleNamespace:
         deltanet_use_beta=True,
         deltanet_use_output_gate=cli.use_output_gate,
         deltanet_use_short_conv=True,
-        force_seq_chunks=1,
+        force_seq_chunks=cli.force_seq_chunks,
         pipe_sp_splits=cli.pipe_sp_splits,
     )
 
@@ -151,6 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--use-output-gate", action="store_true")
     parser.add_argument("--pipe-sp-splits", type=int, default=4)
+    parser.add_argument("--force-seq-chunks", type=int, default=1)
     parser.add_argument("--conv-size", type=int, default=4)
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--warmup", type=int, default=3)
