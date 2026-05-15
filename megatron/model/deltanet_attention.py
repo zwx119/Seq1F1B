@@ -1034,8 +1034,15 @@ class DeltaNetAttention(MegatronModule):
             )
             prep2_event.record(prep_stream)
 
+        current_stream.wait_event(prep2_event)
+        prep2 = prep2_holder["value"]
+        for tensor in (
+            prep2["q"], prep2["k"], prep2["v"], prep2["g"], prep2["A"],
+            prep2["w"], prep2["u"], prep2["raw_A"], prep2["beta"],
+        ):
+            tensor.record_stream(current_stream)
+
         o1 = torch.empty_like(prep1["v"])
-        o2 = None
         o_stream.wait_stream(current_stream)
         with torch.cuda.stream(o_stream):
             with _deltanet_profile("DeltaNetCore.O.flat_first"):
@@ -1052,14 +1059,6 @@ class DeltaNetAttention(MegatronModule):
                     t_block_start=0,
                     t_block_count=prep1["nt"],
                 )
-
-        current_stream.wait_event(prep2_event)
-        prep2 = prep2_holder["value"]
-        for tensor in (
-            prep2["q"], prep2["k"], prep2["v"], prep2["g"], prep2["A"],
-            prep2["w"], prep2["u"], prep2["raw_A"], prep2["beta"],
-        ):
-            tensor.record_stream(current_stream)
 
         h2, v_new2, final_state = chunk_gated_delta_rule_fwd_h(
             k=prep2["k"],
