@@ -213,6 +213,22 @@ def _layout_qkvg_to_bsh(qkvg):
     )
 
 
+@contextlib.contextmanager
+def _temporarily_disable_wu_h_pipeline(enabled: bool):
+    if not enabled:
+        yield
+        return
+    old_value = os.environ.get("FLA_DELTA_WU_H_PIPELINE")
+    os.environ["FLA_DELTA_WU_H_PIPELINE"] = "0"
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop("FLA_DELTA_WU_H_PIPELINE", None)
+        else:
+            os.environ["FLA_DELTA_WU_H_PIPELINE"] = old_value
+
+
 def _deltanet_profile_enabled():
     return (
         os.environ.get("DELTANET_ATTN_NVTX", "0") != "0"
@@ -954,6 +970,10 @@ class DeltaNetAttention(MegatronModule):
                 qkvg_events = {}
                 g_chunks = []
                 use_nvtx = os.environ.get("DELTANET_ATTN_NVTX", "0") != "0"
+                disable_inner_wuh = (
+                    qkvg_pipeline
+                    and os.environ.get("DELTANET_QKVG_PIPELINE_INNER_WUH", "0") == "0"
+                )
 
                 def launch_qkvg(chunk_idx):
                     sl_i = slice(chunk_idx * chunk, (chunk_idx + 1) * chunk)
@@ -984,33 +1004,39 @@ class DeltaNetAttention(MegatronModule):
                         q_i, k_i, v_i, g_i = _layout_qkvg_to_bsh(qkvg_i)
                     if i + 1 < fsc:
                         launch_qkvg(i + 1)
-                    o_i = self._stateful_middle(
-                        q_i,
-                        k_i,
-                        v_i,
-                        hidden_states_bsh[:, sl].contiguous(),
-                        use_conv_cache=(i > 0),
-                        output_final_state=True,
-                    )
+                    with _temporarily_disable_wu_h_pipeline(disable_inner_wuh):
+                        o_i = self._stateful_middle(
+                            q_i,
+                            k_i,
+                            v_i,
+                            hidden_states_bsh[:, sl].contiguous(),
+                            use_conv_cache=(i > 0),
+                            output_final_state=True,
+                        )
                     outs.append(o_i)
                     g_chunks.append(g_i)
                 g = torch.cat(g_chunks, dim=1)
             elif qkvg_chunked:
                 g_chunks = []
+                disable_inner_wuh = (
+                    qkvg_pipeline
+                    and os.environ.get("DELTANET_QKVG_PIPELINE_INNER_WUH", "0") == "0"
+                )
                 for i in range(fsc):
                     sl = slice(i * chunk, (i + 1) * chunk)
                     with _deltanet_profile("DeltaNetAttention.qkv_proj"):
                         qkvg_i, _ = self.qkvg_proj(hidden_states[sl])
                     with _deltanet_profile("DeltaNetAttention.input_layout"):
                         q_i, k_i, v_i, g_i = _layout_qkvg_to_bsh(qkvg_i)
-                    o_i = self._stateful_middle(
-                        q_i,
-                        k_i,
-                        v_i,
-                        hidden_states_bsh[:, sl].contiguous(),
-                        use_conv_cache=(i > 0),
-                        output_final_state=True,
-                    )
+                    with _temporarily_disable_wu_h_pipeline(disable_inner_wuh):
+                        o_i = self._stateful_middle(
+                            q_i,
+                            k_i,
+                            v_i,
+                            hidden_states_bsh[:, sl].contiguous(),
+                            use_conv_cache=(i > 0),
+                            output_final_state=True,
+                        )
                     outs.append(o_i)
                     g_chunks.append(g_i)
                 g = torch.cat(g_chunks, dim=1)
