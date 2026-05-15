@@ -1003,23 +1003,14 @@ class DeltaNetAttention(MegatronModule):
         prep_stream = self._qkvg_lookahead_stream
         o_stream = torch.cuda.Stream(device=hidden_states.device)
         current_stream = torch.cuda.current_stream(hidden_states.device)
-        prep_stream.wait_stream(current_stream)
+        prep1_ready = torch.cuda.Event()
+        prep1_ready.record(current_stream)
+        prep_stream.wait_event(prep1_ready)
         hidden2.record_stream(prep_stream)
         hidden_bsh2.record_stream(prep_stream)
         for state in prep1["conv_states"]:
             if state is not None:
                 state.record_stream(prep_stream)
-
-        prep2_holder = {}
-        prep2_event = torch.cuda.Event()
-        with torch.cuda.stream(prep_stream):
-            prep2_holder["value"] = prepare_half(
-                "second",
-                hidden2,
-                hidden_bsh2,
-                prep1["conv_states"],
-            )
-            prep2_event.record(prep_stream)
 
         h1, v_new1, mid_state = chunk_gated_delta_rule_fwd_h(
             k=prep1["k"],
@@ -1031,6 +1022,17 @@ class DeltaNetAttention(MegatronModule):
             t_block_start=0,
             t_block_count=prep1["nt"],
         )
+
+        prep2_holder = {}
+        prep2_event = torch.cuda.Event()
+        with torch.cuda.stream(prep_stream):
+            prep2_holder["value"] = prepare_half(
+                "second",
+                hidden2,
+                hidden_bsh2,
+                prep1["conv_states"],
+            )
+            prep2_event.record(prep_stream)
 
         o1 = torch.empty_like(prep1["v"])
         o2 = None
