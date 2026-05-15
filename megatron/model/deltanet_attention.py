@@ -34,6 +34,15 @@ from megatron.core import mpu, tensor_parallel
 from megatron.model.module import MegatronModule
 
 try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    triton = None
+    tl = None
+    HAS_TRITON = False
+
+try:
     from einops import rearrange
 except ImportError:
     rearrange = None
@@ -66,6 +75,142 @@ except ImportError:
 
 
 _DELTANET_TIMING_STATS = {}
+
+
+if HAS_TRITON:
+    @triton.jit
+    def _qkvg_sbh_to_bsh_fwd_kernel(
+        qkvg,
+        q,
+        k,
+        v,
+        g,
+        N: tl.constexpr,
+        S: tl.constexpr,
+        B: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < N
+        i_d = offsets % D
+        tmp = offsets // D
+        i_s = tmp % S
+        i_b = tmp // S
+
+        in_base = (i_s * B + i_b) * (4 * D) + i_d
+        out = (i_b * S + i_s) * D + i_d
+
+        q_val = tl.load(qkvg + in_base, mask=mask)
+        k_val = tl.load(qkvg + in_base + D, mask=mask)
+        v_val = tl.load(qkvg + in_base + 2 * D, mask=mask)
+        g_val = tl.load(qkvg + in_base + 3 * D, mask=mask)
+
+        tl.store(q + out, q_val, mask=mask)
+        tl.store(k + out, k_val, mask=mask)
+        tl.store(v + out, v_val, mask=mask)
+        tl.store(g + out, g_val, mask=mask)
+
+
+    @triton.jit
+    def _qkvg_sbh_to_bsh_bwd_kernel(
+        dq,
+        dk,
+        dv,
+        dg,
+        dqkvg,
+        N: tl.constexpr,
+        S: tl.constexpr,
+        B: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < N
+        i_d = offsets % D
+        tmp = offsets // D
+        i_s = tmp % S
+        i_b = tmp // S
+
+        in_out = (i_b * S + i_s) * D + i_d
+        grad_base = (i_s * B + i_b) * (4 * D) + i_d
+
+        tl.store(dqkvg + grad_base, tl.load(dq + in_out, mask=mask), mask=mask)
+        tl.store(dqkvg + grad_base + D, tl.load(dk + in_out, mask=mask), mask=mask)
+        tl.store(dqkvg + grad_base + 2 * D, tl.load(dv + in_out, mask=mask), mask=mask)
+        tl.store(dqkvg + grad_base + 3 * D, tl.load(dg + in_out, mask=mask), mask=mask)
+
+
+class _QKVGLayoutFunc(torch.autograd.Function):
+    """Split [S, B, 4D] qkvg into four contiguous [B, S, D] tensors."""
+
+    @staticmethod
+    def forward(ctx, qkvg):
+        S, B, four_d = qkvg.shape
+        D = four_d // 4
+        q = torch.empty((B, S, D), device=qkvg.device, dtype=qkvg.dtype)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+        g = torch.empty_like(q)
+
+        n_elements = B * S * D
+        block = 256
+        grid = (triton.cdiv(n_elements, block),)
+        _qkvg_sbh_to_bsh_fwd_kernel[grid](
+            qkvg, q, k, v, g,
+            n_elements, S, B, D,
+            BLOCK=block,
+        )
+        ctx.shape = (S, B, four_d)
+        return q, k, v, g
+
+    @staticmethod
+    def backward(ctx, dq, dk, dv, dg):
+        S, B, four_d = ctx.shape
+        D = four_d // 4
+
+        grads = [dq, dk, dv, dg]
+        ref = next((x for x in grads if x is not None), None)
+        if ref is None:
+            return None
+        grads = [
+            x.contiguous() if x is not None else torch.zeros((B, S, D), device=ref.device, dtype=ref.dtype)
+            for x in grads
+        ]
+
+        dqkvg = torch.empty((S, B, four_d), device=ref.device, dtype=ref.dtype)
+        n_elements = B * S * D
+        block = 256
+        grid = (triton.cdiv(n_elements, block),)
+        _qkvg_sbh_to_bsh_bwd_kernel[grid](
+            grads[0], grads[1], grads[2], grads[3], dqkvg,
+            n_elements, S, B, D,
+            BLOCK=block,
+        )
+        return dqkvg
+
+
+def _can_fuse_qkvg_layout(qkvg):
+    return (
+        HAS_TRITON
+        and qkvg.is_cuda
+        and qkvg.is_contiguous()
+        and qkvg.dim() == 3
+        and qkvg.shape[-1] % 4 == 0
+        and os.environ.get("DELTANET_FUSED_QKVG_LAYOUT", "1") != "0"
+    )
+
+
+def _layout_qkvg_to_bsh(qkvg):
+    if _can_fuse_qkvg_layout(qkvg):
+        return _QKVGLayoutFunc.apply(qkvg)
+    q, k, v, g = torch.chunk(qkvg, 4, dim=-1)
+    return (
+        q.transpose(0, 1).contiguous(),
+        k.transpose(0, 1).contiguous(),
+        v.transpose(0, 1).contiguous(),
+        g.transpose(0, 1).contiguous(),
+    )
 
 
 def _deltanet_profile_enabled():
@@ -689,6 +834,13 @@ class DeltaNetAttention(MegatronModule):
         profile_token = _deltanet_profile_start("DeltaNetAttention.forward")
         args = get_args()
         fsc = getattr(args, 'force_seq_chunks', 1)
+        qkvg_pipeline = os.environ.get("DELTANET_QKVG_PIPELINE", "0") != "0"
+        if (
+            qkvg_pipeline
+            and args.pipe_sp_splits == 1
+            and (micro_sp_idx is None or micro_sp_idx == 0)
+        ):
+            fsc = max(fsc, int(os.environ.get("DELTANET_QKVG_PIPELINE_CHUNKS", "2")))
         use_force_chunks = (
             args.pipe_sp_splits == 1
             and fsc > 1
@@ -715,6 +867,7 @@ class DeltaNetAttention(MegatronModule):
             and (
                 os.environ.get("DELTANET_QKVG_CHUNKED", "0") != "0"
                 or os.environ.get("DELTANET_QKVG_LOOKAHEAD", "0") != "0"
+                or qkvg_pipeline
             )
             # The first implementation is a diagnostic for the single-rank
             # force-chunk path. Real SP+TP lookahead needs a schedule-level
@@ -727,7 +880,10 @@ class DeltaNetAttention(MegatronModule):
         )
         qkvg_lookahead = (
             qkvg_chunked
-            and os.environ.get("DELTANET_QKVG_LOOKAHEAD", "0") != "0"
+            and (
+                os.environ.get("DELTANET_QKVG_LOOKAHEAD", "0") != "0"
+                or qkvg_pipeline
+            )
         )
 
         if not qkvg_chunked:
@@ -736,7 +892,6 @@ class DeltaNetAttention(MegatronModule):
             with _deltanet_profile("DeltaNetAttention.qkv_proj"):
                 if self.use_gate:
                     qkvg, _ = self.qkvg_proj(hidden_states)
-                    q, k, v, g = torch.chunk(qkvg, 4, dim=-1)
                 elif not self.use_gate:
                     q, _ = self.q_proj(hidden_states)  # [s, b, key_dim_per_partition]
                     k, _ = self.k_proj(hidden_states)  # [s, b, key_dim_per_partition]
@@ -745,11 +900,12 @@ class DeltaNetAttention(MegatronModule):
 
             # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
             with _deltanet_profile("DeltaNetAttention.input_layout"):
-                q = q.transpose(0, 1).contiguous()
-                k = k.transpose(0, 1).contiguous()
-                v = v.transpose(0, 1).contiguous()
-                if g is not None:
-                    g = g.transpose(0, 1).contiguous()
+                if self.use_gate:
+                    q, k, v, g = _layout_qkvg_to_bsh(qkvg)
+                else:
+                    q = q.transpose(0, 1).contiguous()
+                    k = k.transpose(0, 1).contiguous()
+                    v = v.transpose(0, 1).contiguous()
         else:
             q = k = v = g = None
 
@@ -825,11 +981,7 @@ class DeltaNetAttention(MegatronModule):
                     qkvg_i = qkvg_cache.pop(i)
                     qkvg_i.record_stream(current_stream)
                     with _deltanet_profile("DeltaNetAttention.input_layout"):
-                        q_i, k_i, v_i, g_i = torch.chunk(qkvg_i, 4, dim=-1)
-                        q_i = q_i.transpose(0, 1).contiguous()
-                        k_i = k_i.transpose(0, 1).contiguous()
-                        v_i = v_i.transpose(0, 1).contiguous()
-                        g_i = g_i.transpose(0, 1).contiguous()
+                        q_i, k_i, v_i, g_i = _layout_qkvg_to_bsh(qkvg_i)
                     if i + 1 < fsc:
                         launch_qkvg(i + 1)
                     o_i = self._stateful_middle(
@@ -850,11 +1002,7 @@ class DeltaNetAttention(MegatronModule):
                     with _deltanet_profile("DeltaNetAttention.qkv_proj"):
                         qkvg_i, _ = self.qkvg_proj(hidden_states[sl])
                     with _deltanet_profile("DeltaNetAttention.input_layout"):
-                        q_i, k_i, v_i, g_i = torch.chunk(qkvg_i, 4, dim=-1)
-                        q_i = q_i.transpose(0, 1).contiguous()
-                        k_i = k_i.transpose(0, 1).contiguous()
-                        v_i = v_i.transpose(0, 1).contiguous()
-                        g_i = g_i.transpose(0, 1).contiguous()
+                        q_i, k_i, v_i, g_i = _layout_qkvg_to_bsh(qkvg_i)
                     o_i = self._stateful_middle(
                         q_i,
                         k_i,
