@@ -141,6 +141,113 @@ if HAS_TRITON:
         tl.store(dqkvg + grad_base + 3 * D, tl.load(dg + in_out, mask=mask), mask=mask)
 
 
+    @triton.jit
+    def _qkvg_postprocess_fwd_kernel(
+        qkvg,
+        q,
+        k,
+        v,
+        g,
+        q_weight,
+        k_weight,
+        v_weight,
+        q_state,
+        k_state,
+        v_state,
+        q_final,
+        k_final,
+        v_final,
+        S: tl.constexpr,
+        B: tl.constexpr,
+        H: tl.constexpr,
+        D_HEAD: tl.constexpr,
+        D_MODEL: tl.constexpr,
+        W: tl.constexpr,
+        NT: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_INIT: tl.constexpr,
+    ):
+        i_t = tl.program_id(0)
+        i_h = tl.program_id(1)
+        i_b = tl.program_id(2)
+
+        o_t = i_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        o_dh = tl.arange(0, BLOCK_D)
+        o_d = i_h * D_HEAD + o_dh
+        m_t = o_t < S
+        m_d = o_dh < D_HEAD
+        mask = m_t[:, None] & m_d[None, :]
+
+        b_q = tl.zeros((BLOCK_T, BLOCK_D), dtype=tl.float32)
+        b_k = tl.zeros((BLOCK_T, BLOCK_D), dtype=tl.float32)
+        b_v = tl.zeros((BLOCK_T, BLOCK_D), dtype=tl.float32)
+
+        for i_w in tl.static_range(0, W):
+            rel_t = i_w - W + 1
+            src_t = o_t + rel_t
+            m_x = (src_t >= 0) & (src_t < S)
+            in_base = (src_t[:, None] * B + i_b) * (4 * D_MODEL) + o_d[None, :]
+
+            x_q = tl.load(qkvg + in_base, mask=m_x[:, None] & m_d[None, :], other=0.).to(tl.float32)
+            x_k = tl.load(qkvg + in_base + D_MODEL, mask=m_x[:, None] & m_d[None, :], other=0.).to(tl.float32)
+            x_v = tl.load(qkvg + in_base + 2 * D_MODEL, mask=m_x[:, None] & m_d[None, :], other=0.).to(tl.float32)
+
+            if HAS_INIT:
+                state_t = src_t + W
+                m_s = (src_t < 0) & (state_t >= 0) & (state_t < W)
+                state_base = i_b * D_MODEL * W + o_d[None, :] * W + state_t[:, None]
+                x_q += tl.load(q_state + state_base, mask=m_s[:, None] & m_d[None, :], other=0.).to(tl.float32)
+                x_k += tl.load(k_state + state_base, mask=m_s[:, None] & m_d[None, :], other=0.).to(tl.float32)
+                x_v += tl.load(v_state + state_base, mask=m_s[:, None] & m_d[None, :], other=0.).to(tl.float32)
+
+            w_q = tl.load(q_weight + o_d * W + i_w, mask=m_d, other=0.).to(tl.float32)
+            w_k = tl.load(k_weight + o_d * W + i_w, mask=m_d, other=0.).to(tl.float32)
+            w_v = tl.load(v_weight + o_d * W + i_w, mask=m_d, other=0.).to(tl.float32)
+            b_q += x_q * w_q[None, :]
+            b_k += x_k * w_k[None, :]
+            b_v += x_v * w_v[None, :]
+
+        b_q = b_q * tl.sigmoid(b_q)
+        b_k = b_k * tl.sigmoid(b_k)
+        b_v = b_v * tl.sigmoid(b_v)
+
+        q_rstd = tl.rsqrt(tl.sum(b_q * b_q, axis=1) + 1e-6)
+        k_rstd = tl.rsqrt(tl.sum(b_k * b_k, axis=1) + 1e-6)
+        b_q = b_q * q_rstd[:, None]
+        b_k = b_k * k_rstd[:, None]
+
+        out_qkv = ((i_b * S + o_t[:, None]) * H + i_h) * D_HEAD + o_dh[None, :]
+        out_g = (i_b * S + o_t[:, None]) * D_MODEL + o_d[None, :]
+        g_base = (o_t[:, None] * B + i_b) * (4 * D_MODEL) + 3 * D_MODEL + o_d[None, :]
+
+        tl.store(q + out_qkv, b_q, mask=mask)
+        tl.store(k + out_qkv, b_k, mask=mask)
+        tl.store(v + out_qkv, b_v, mask=mask)
+        tl.store(g + out_g, tl.load(qkvg + g_base, mask=mask, other=0.), mask=mask)
+
+        is_last = i_t == (NT - 1)
+        for i_w in tl.static_range(0, W):
+            state_src_t = S - W + i_w
+            state_in = (state_src_t * B + i_b) * (4 * D_MODEL) + o_d
+            state_out = i_b * D_MODEL * W + o_d * W + i_w
+            tl.store(
+                q_final + state_out,
+                tl.load(qkvg + state_in, mask=is_last & m_d, other=0.),
+                mask=is_last & m_d,
+            )
+            tl.store(
+                k_final + state_out,
+                tl.load(qkvg + state_in + D_MODEL, mask=is_last & m_d, other=0.),
+                mask=is_last & m_d,
+            )
+            tl.store(
+                v_final + state_out,
+                tl.load(qkvg + state_in + 2 * D_MODEL, mask=is_last & m_d, other=0.),
+                mask=is_last & m_d,
+            )
+
+
 class _QKVGLayoutFunc(torch.autograd.Function):
     """Split [S, B, 4D] qkvg into four contiguous [B, S, D] tensors."""
 
@@ -211,6 +318,111 @@ def _layout_qkvg_to_bsh(qkvg):
         v.transpose(0, 1).contiguous(),
         g.transpose(0, 1).contiguous(),
     )
+
+
+def _qkvg_postprocess_fused(
+    qkvg,
+    q_weight,
+    k_weight,
+    v_weight,
+    initial_conv_states,
+    num_heads,
+    head_dim,
+):
+    if (
+        not HAS_TRITON
+        or os.environ.get("DELTANET_FUSED_QKVG_POSTPROCESS", "0") == "0"
+        or not qkvg.is_cuda
+        or not qkvg.is_contiguous()
+        or qkvg.dim() != 3
+        or qkvg.shape[-1] % 4 != 0
+        or q_weight is None
+        or k_weight is None
+        or v_weight is None
+    ):
+        return None
+
+    S, B, four_d = qkvg.shape
+    d_model = four_d // 4
+    if d_model != num_heads * head_dim:
+        return None
+    if head_dim > 256:
+        return None
+
+    q_weight = rearrange(q_weight, "d 1 w -> d w")
+    k_weight = rearrange(k_weight, "d 1 w -> d w")
+    v_weight = rearrange(v_weight, "d 1 w -> d w")
+    if (
+        q_weight.shape != k_weight.shape
+        or q_weight.shape != v_weight.shape
+        or q_weight.shape[0] != d_model
+        or not q_weight.is_contiguous()
+        or not k_weight.is_contiguous()
+        or not v_weight.is_contiguous()
+    ):
+        return None
+
+    W = q_weight.shape[1]
+    if W < 2 or W > 8:
+        return None
+
+    q_state, k_state, v_state = initial_conv_states
+    has_init = q_state is not None
+    if has_init:
+        expected_state = (B, d_model, W)
+        if (
+            q_state.shape != expected_state
+            or k_state.shape != expected_state
+            or v_state.shape != expected_state
+            or not q_state.is_contiguous()
+            or not k_state.is_contiguous()
+            or not v_state.is_contiguous()
+        ):
+            return None
+    else:
+        q_state = k_state = v_state = qkvg
+
+    q = torch.empty((B, S, num_heads, head_dim), device=qkvg.device, dtype=qkvg.dtype)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    g = torch.empty((B, S, d_model), device=qkvg.device, dtype=qkvg.dtype)
+    q_final = torch.empty((B, d_model, W), device=qkvg.device, dtype=qkvg.dtype)
+    k_final = torch.empty_like(q_final)
+    v_final = torch.empty_like(q_final)
+
+    block_t = int(os.environ.get("DELTANET_FUSED_QKVG_POSTPROCESS_BT", "16"))
+    if block_t not in (8, 16, 32):
+        block_t = 16
+    block_d = triton.next_power_of_2(head_dim)
+    nt = triton.cdiv(S, block_t)
+    grid = (nt, num_heads, B)
+    _qkvg_postprocess_fwd_kernel[grid](
+        qkvg,
+        q,
+        k,
+        v,
+        g,
+        q_weight,
+        k_weight,
+        v_weight,
+        q_state,
+        k_state,
+        v_state,
+        q_final,
+        k_final,
+        v_final,
+        S=S,
+        B=B,
+        H=num_heads,
+        D_HEAD=head_dim,
+        D_MODEL=d_model,
+        W=W,
+        NT=nt,
+        BLOCK_T=block_t,
+        BLOCK_D=block_d,
+        HAS_INIT=has_init,
+    )
+    return q, k, v, g, (q_final, k_final, v_final)
 
 
 @contextlib.contextmanager
@@ -923,15 +1135,37 @@ class DeltaNetAttention(MegatronModule):
         def prepare_half(tag, hidden_sbh, hidden_bsh_i, initial_conv_states):
             with _deltanet_profile(f"DeltaNetAttention.qkv_proj.flat_{tag}"):
                 qkvg_i, _ = self.qkvg_proj(hidden_sbh)
-            with _deltanet_profile(f"DeltaNetAttention.input_layout.flat_{tag}"):
-                q_flat, k_flat, v_flat, g_flat = _layout_qkvg_to_bsh(qkvg_i)
-            with _deltanet_profile(f"DeltaNetAttention.short_conv.flat_{tag}"):
-                q_i, k_i, v_i, conv_states = run_conv(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    initial_conv_states,
-                )
+            fused_post = None
+            if (
+                self.use_short_conv
+                and self.qk_activation == 'silu'
+                and self.qk_norm == 'l2'
+                and self.q_conv1d.bias is None
+                and self.k_conv1d.bias is None
+                and self.v_conv1d.bias is None
+            ):
+                with _deltanet_profile(f"DeltaNetAttention.qkvg_postprocess_fused.flat_{tag}"):
+                    fused_post = _qkvg_postprocess_fused(
+                        qkvg_i,
+                        self.q_conv1d.weight,
+                        self.k_conv1d.weight,
+                        self.v_conv1d.weight,
+                        initial_conv_states,
+                        self.num_attention_heads_per_partition,
+                        self.head_dim,
+                    )
+            if fused_post is not None:
+                q_i, k_i, v_i, g_flat, conv_states = fused_post
+            else:
+                with _deltanet_profile(f"DeltaNetAttention.input_layout.flat_{tag}"):
+                    q_flat, k_flat, v_flat, g_flat = _layout_qkvg_to_bsh(qkvg_i)
+                with _deltanet_profile(f"DeltaNetAttention.short_conv.flat_{tag}"):
+                    q_i, k_i, v_i, conv_states = run_conv(
+                        q_flat,
+                        k_flat,
+                        v_flat,
+                        initial_conv_states,
+                    )
             with _deltanet_profile(f"DeltaNetAttention.beta.flat_{tag}"):
                 if self.use_beta:
                     beta_i = self.b_proj(hidden_bsh_i).sigmoid()
