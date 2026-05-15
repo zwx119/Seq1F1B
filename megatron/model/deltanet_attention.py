@@ -828,6 +828,273 @@ class DeltaNetAttention(MegatronModule):
         _deltanet_profile_end(profile_token)
         return o
 
+    def _qkvg_flat_pipeline_forward(self, hidden_states, hidden_states_bsh):
+        """Two-stage diagnostic schedule with one global split point.
+
+        This is a forward-only profiling path for the single-rank attention
+        microbench. It keeps qkvg/layout/conv/beta/WY/H/O on the same split
+        boundary so the timeline does not become an outer x inner split.
+        """
+        from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+        from fla.ops.common.chunk_o import chunk_fwd_o_range_into
+        from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+        from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd_range_into
+        from fla.ops.utils.solve_tril import solve_tril_range_into
+
+        assert self.use_gate, "qkvg flat pipeline requires fused qkvg projection."
+        B, T, _ = hidden_states_bsh.shape
+        BT = 64
+        NT = math.ceil(T / BT)
+        if NT < 2:
+            raise RuntimeError("DELTANET_QKVG_PIPELINE requires at least two chunks")
+        if "FLA_DELTA_WU_H_SPLIT_NT" in os.environ:
+            split_nt = int(os.environ["FLA_DELTA_WU_H_SPLIT_NT"])
+        else:
+            split_frac = float(os.environ.get("FLA_DELTA_WU_H_SPLIT_FRAC", "0.5"))
+            split_nt = int(round(NT * split_frac))
+        split_nt = max(1, min(NT - 1, split_nt))
+        split_t = min(T, split_nt * BT)
+
+        if T % BT != 0:
+            raise RuntimeError("qkvg flat pipeline currently expects seq_len to be a multiple of 64")
+
+        qk_act = 'silu' if self.qk_activation == 'silu' else None
+        scale = self.head_dim ** -0.5
+        use_l2 = self.qk_norm == 'l2'
+        output_final_state = False
+        initial_state = self.state_cache.get('recurrent_state', None)
+
+        def run_conv(q_flat, k_flat, v_flat, initial_conv_states):
+            if self.use_short_conv:
+                q_state, k_state, v_state = initial_conv_states
+                q_out, q_final = causal_conv1d_fwd(
+                    x=q_flat,
+                    weight=rearrange(self.q_conv1d.weight, "d 1 w -> d w"),
+                    bias=self.q_conv1d.bias,
+                    residual=None,
+                    initial_state=q_state,
+                    output_final_state=True,
+                    activation=qk_act,
+                )
+                k_out, k_final = causal_conv1d_fwd(
+                    x=k_flat,
+                    weight=rearrange(self.k_conv1d.weight, "d 1 w -> d w"),
+                    bias=self.k_conv1d.bias,
+                    residual=None,
+                    initial_state=k_state,
+                    output_final_state=True,
+                    activation=qk_act,
+                )
+                v_out, v_final = causal_conv1d_fwd(
+                    x=v_flat,
+                    weight=rearrange(self.v_conv1d.weight, "d 1 w -> d w"),
+                    bias=self.v_conv1d.bias,
+                    residual=None,
+                    initial_state=v_state,
+                    output_final_state=True,
+                    activation='silu',
+                )
+                conv_states = (q_final, k_final, v_final)
+            else:
+                if self.qk_activation == 'silu':
+                    q_out, k_out = F.silu(q_flat), F.silu(k_flat)
+                else:
+                    q_out, k_out = q_flat, k_flat
+                v_out = F.silu(v_flat)
+                conv_states = (None, None, None)
+
+            q_out = rearrange(q_out, 'b s (h d) -> b s h d', d=self.head_dim)
+            k_out = rearrange(k_out, 'b s (h d) -> b s h d', d=self.head_dim)
+            v_out = rearrange(v_out, 'b s (h d) -> b s h d', d=self.head_dim)
+
+            if self.use_short_conv and self.qk_activation != 'silu':
+                if self.qk_activation == 'relu':
+                    q_out, k_out = q_out.relu(), k_out.relu()
+                elif self.qk_activation == 'elu':
+                    q_out = (F.elu(q_out, 1., False) + 1.).to(q_out)
+                    k_out = (F.elu(k_out, 1., False) + 1.).to(k_out)
+
+            if use_l2:
+                q_out, _ = l2norm_fwd(q_out)
+                k_out, _ = l2norm_fwd(k_out)
+
+            return q_out, k_out, v_out, conv_states
+
+        def prepare_half(tag, hidden_sbh, hidden_bsh_i, initial_conv_states):
+            with _deltanet_profile(f"DeltaNetAttention.qkv_proj.flat_{tag}"):
+                qkvg_i, _ = self.qkvg_proj(hidden_sbh)
+            with _deltanet_profile(f"DeltaNetAttention.input_layout.flat_{tag}"):
+                q_flat, k_flat, v_flat, g_flat = _layout_qkvg_to_bsh(qkvg_i)
+            with _deltanet_profile(f"DeltaNetAttention.short_conv.flat_{tag}"):
+                q_i, k_i, v_i, conv_states = run_conv(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    initial_conv_states,
+                )
+            with _deltanet_profile(f"DeltaNetAttention.beta.flat_{tag}"):
+                if self.use_beta:
+                    beta_i = self.b_proj(hidden_bsh_i).sigmoid()
+                else:
+                    beta_i = torch.ones(
+                        B,
+                        hidden_bsh_i.shape[1],
+                        self.num_attention_heads_per_partition,
+                        device=hidden_bsh_i.device,
+                        dtype=hidden_bsh_i.dtype,
+                    )
+            with _deltanet_profile(f"DeltaNetCore.WY.A.flat_{tag}"):
+                raw_A_i = chunk_scaled_dot_kkt_fwd(
+                    k=k_i,
+                    beta=beta_i,
+                    cu_seqlens=None,
+                    chunk_size=BT,
+                    output_dtype=torch.float32,
+                    chunk_indices=None,
+                )
+            A_i = torch.zeros_like(raw_A_i, dtype=k_i.dtype)
+            w_i = torch.empty_like(k_i)
+            u_i = torch.empty_like(v_i)
+            nt_i = math.ceil(hidden_bsh_i.shape[1] / BT)
+            with _deltanet_profile(f"DeltaNetCore.WY.solve_inverse.flat_{tag}"):
+                solve_tril_range_into(
+                    A=raw_A_i,
+                    Ai=A_i,
+                    t_block_start=0,
+                    t_block_count=nt_i,
+                    cu_seqlens=None,
+                    chunk_indices=None,
+                )
+            with _deltanet_profile(f"DeltaNetCore.recompute_wu.flat_{tag}"):
+                recompute_w_u_fwd_range_into(
+                    k=k_i,
+                    v=v_i,
+                    beta=beta_i,
+                    A=A_i,
+                    w=w_i,
+                    u=u_i,
+                    t_block_start=0,
+                    t_block_count=nt_i,
+                    cu_seqlens=None,
+                )
+            return {
+                "q": q_i,
+                "k": k_i,
+                "v": v_i,
+                "g": g_flat,
+                "A": A_i,
+                "w": w_i,
+                "u": u_i,
+                "conv_states": conv_states,
+                "nt": nt_i,
+                "raw_A": raw_A_i,
+                "beta": beta_i,
+            }
+
+        hidden1 = hidden_states[:split_t].contiguous()
+        hidden2 = hidden_states[split_t:].contiguous()
+        hidden_bsh1 = hidden_states_bsh[:, :split_t].contiguous()
+        hidden_bsh2 = hidden_states_bsh[:, split_t:].contiguous()
+
+        prep1 = prepare_half("first", hidden1, hidden_bsh1, (None, None, None))
+
+        if self._qkvg_lookahead_stream is None:
+            self._qkvg_lookahead_stream = torch.cuda.Stream()
+        prep_stream = self._qkvg_lookahead_stream
+        o_stream = torch.cuda.Stream(device=hidden_states.device)
+        current_stream = torch.cuda.current_stream(hidden_states.device)
+        prep_stream.wait_stream(current_stream)
+        hidden2.record_stream(prep_stream)
+        hidden_bsh2.record_stream(prep_stream)
+        for state in prep1["conv_states"]:
+            if state is not None:
+                state.record_stream(prep_stream)
+
+        prep2_holder = {}
+        prep2_event = torch.cuda.Event()
+        with torch.cuda.stream(prep_stream):
+            prep2_holder["value"] = prepare_half(
+                "second",
+                hidden2,
+                hidden_bsh2,
+                prep1["conv_states"],
+            )
+            prep2_event.record(prep_stream)
+
+        h1, v_new1, mid_state = chunk_gated_delta_rule_fwd_h(
+            k=prep1["k"],
+            w=prep1["w"],
+            u=prep1["u"],
+            g=None,
+            initial_state=initial_state,
+            output_final_state=True,
+            t_block_start=0,
+            t_block_count=prep1["nt"],
+        )
+
+        o1 = torch.empty_like(prep1["v"])
+        o2 = None
+        o_stream.wait_stream(current_stream)
+        with torch.cuda.stream(o_stream):
+            with _deltanet_profile("DeltaNetCore.O.flat_first"):
+                chunk_fwd_o_range_into(
+                    q=prep1["q"],
+                    k=prep1["k"],
+                    v=v_new1,
+                    h=h1,
+                    o=o1,
+                    g=None,
+                    scale=scale,
+                    cu_seqlens=None,
+                    chunk_indices=None,
+                    t_block_start=0,
+                    t_block_count=prep1["nt"],
+                )
+
+        current_stream.wait_event(prep2_event)
+        prep2 = prep2_holder["value"]
+        for tensor in (
+            prep2["q"], prep2["k"], prep2["v"], prep2["g"], prep2["A"],
+            prep2["w"], prep2["u"], prep2["raw_A"], prep2["beta"],
+        ):
+            tensor.record_stream(current_stream)
+
+        h2, v_new2, final_state = chunk_gated_delta_rule_fwd_h(
+            k=prep2["k"],
+            w=prep2["w"],
+            u=prep2["u"],
+            g=None,
+            initial_state=mid_state,
+            output_final_state=output_final_state,
+            t_block_start=0,
+            t_block_count=prep2["nt"],
+        )
+
+        o2 = torch.empty_like(prep2["v"])
+        with _deltanet_profile("DeltaNetCore.O.flat_second"):
+            chunk_fwd_o_range_into(
+                q=prep2["q"],
+                k=prep2["k"],
+                v=v_new2,
+                h=h2,
+                o=o2,
+                g=None,
+                scale=scale,
+                cu_seqlens=None,
+                chunk_indices=None,
+                t_block_start=0,
+                t_block_count=prep2["nt"],
+            )
+        current_stream.wait_stream(o_stream)
+
+        g = torch.cat((prep1["g"], prep2["g"]), dim=1)
+        o = torch.cat((o1, o2), dim=1)
+
+        for tensor in (h1, h2, v_new1, v_new2, mid_state, final_state, o1, o2, g, o):
+            if tensor is not None:
+                tensor.record_stream(current_stream)
+        return o, g
+
     def forward(
         self,
         hidden_states,      # [s, b, h] (Megatron convention)
@@ -850,9 +1117,27 @@ class DeltaNetAttention(MegatronModule):
         profile_token = _deltanet_profile_start("DeltaNetAttention.forward")
         args = get_args()
         fsc = getattr(args, 'force_seq_chunks', 1)
-        qkvg_pipeline = os.environ.get("DELTANET_QKVG_PIPELINE", "0") != "0"
+        qkvg_pipeline_requested = os.environ.get("DELTANET_QKVG_PIPELINE", "0") != "0"
+        qkvg_pipeline_mode = os.environ.get("DELTANET_QKVG_PIPELINE_MODE", "flat").lower()
+        qkvg_pipeline_flat = (
+            qkvg_pipeline_requested
+            and qkvg_pipeline_mode == "flat"
+            and args.pipe_sp_splits == 1
+            and (micro_sp_idx is None or micro_sp_idx == 0)
+            and self.use_gate
+            and torch.cuda.is_available()
+            and not torch.is_grad_enabled()
+            and not (
+                self.sequence_parallel
+                and mpu.get_tensor_model_parallel_world_size() > 1
+            )
+        )
+        qkvg_pipeline_outer = (
+            qkvg_pipeline_requested
+            and qkvg_pipeline_mode == "outer"
+        )
         if (
-            qkvg_pipeline
+            qkvg_pipeline_outer
             and args.pipe_sp_splits == 1
             and (micro_sp_idx is None or micro_sp_idx == 0)
         ):
@@ -883,7 +1168,7 @@ class DeltaNetAttention(MegatronModule):
             and (
                 os.environ.get("DELTANET_QKVG_CHUNKED", "0") != "0"
                 or os.environ.get("DELTANET_QKVG_LOOKAHEAD", "0") != "0"
-                or qkvg_pipeline
+                or qkvg_pipeline_outer
             )
             # The first implementation is a diagnostic for the single-rank
             # force-chunk path. Real SP+TP lookahead needs a schedule-level
@@ -898,11 +1183,11 @@ class DeltaNetAttention(MegatronModule):
             qkvg_chunked
             and (
                 os.environ.get("DELTANET_QKVG_LOOKAHEAD", "0") != "0"
-                or qkvg_pipeline
+                or qkvg_pipeline_outer
             )
         )
 
-        if not qkvg_chunked:
+        if not qkvg_chunked and not qkvg_pipeline_flat:
             # ============ Projections (keep [s, b, h] for ColumnParallelLinear) ============
             # ColumnParallelLinear: [s(/tp), b, h] -> all-gather dim-0 -> [s, b, h] -> matmul -> [s, b, h/tp]
             with _deltanet_profile("DeltaNetAttention.qkv_proj"):
@@ -950,7 +1235,16 @@ class DeltaNetAttention(MegatronModule):
         # from all other system-level sources of fp noise, so that a bit-level
         # (fp32) diff between SP=1 and SP=1+force-seq-chunks=N proves Seq1F1B's
         # DeltaNet integration is algorithmically correct.
-        if use_force_chunks:
+        if qkvg_pipeline_flat:
+            # This path intentionally owns the whole single-span sequence and
+            # applies one shared split to qkvg/conv/KKT/WU/H/O. It is
+            # forward-only because it bypasses the autograd wrapper used by
+            # the normal training path.
+            self._clear_states()
+            with _deltanet_profile("DeltaNetAttention.qkvg_flat_pipeline"):
+                o, g = self._qkvg_flat_pipeline_forward(hidden_states, hidden_states_bsh)
+            self._clear_states()
+        elif use_force_chunks:
             assert seq_len % fsc == 0, (
                 f"seq_len {seq_len} must be divisible by "
                 f"--force-seq-chunks {fsc}")
@@ -971,7 +1265,7 @@ class DeltaNetAttention(MegatronModule):
                 g_chunks = []
                 use_nvtx = os.environ.get("DELTANET_ATTN_NVTX", "0") != "0"
                 disable_inner_wuh = (
-                    qkvg_pipeline
+                    qkvg_pipeline_outer
                     and os.environ.get("DELTANET_QKVG_PIPELINE_INNER_WUH", "0") == "0"
                 )
 
@@ -1019,7 +1313,7 @@ class DeltaNetAttention(MegatronModule):
             elif qkvg_chunked:
                 g_chunks = []
                 disable_inner_wuh = (
-                    qkvg_pipeline
+                    qkvg_pipeline_outer
                     and os.environ.get("DELTANET_QKVG_PIPELINE_INNER_WUH", "0") == "0"
                 )
                 for i in range(fsc):
