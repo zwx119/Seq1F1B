@@ -1040,6 +1040,87 @@ class DeltaNetAttention(MegatronModule):
         _deltanet_profile_end(profile_token)
         return o
 
+    def _stateful_middle_preprocessed(self, q, k, v, hidden_states_bsh,
+                                      output_final_state):
+        """Delta rule core for q/k/v that already passed conv + qk l2norm."""
+        profile_token = _deltanet_profile_start("DeltaNetAttention.stateful_middle_preprocessed")
+        args = get_args()
+        batch_size, seq_len, _ = hidden_states_bsh.shape
+        mode = 'fused_recurrent' if seq_len <= 64 else self.deltanet_mode
+        use_ho_pipeline = (
+            mode == 'chunk'
+            and self._should_use_ho_pipeline()
+        )
+
+        with _deltanet_profile("DeltaNetAttention.beta"):
+            if self.use_beta:
+                beta = self.b_proj(hidden_states_bsh).sigmoid()
+            else:
+                beta = torch.ones(
+                    batch_size, seq_len, self.num_attention_heads_per_partition,
+                    device=hidden_states_bsh.device, dtype=hidden_states_bsh.dtype
+                )
+
+        initial_state = self.state_cache.get('recurrent_state', None)
+
+        with _deltanet_profile("DeltaNetAttention.delta_rule_core"):
+            if output_final_state and mode == 'chunk':
+                orig_dtype = q.dtype
+                needs_cast = (orig_dtype == torch.float32)
+                if needs_cast:
+                    q_kv_dtype = torch.bfloat16
+                    q = q.to(q_kv_dtype)
+                    k = k.to(q_kv_dtype)
+                    v = v.to(q_kv_dtype)
+                    beta = beta.to(q_kv_dtype)
+                o = DeltaNetChunkFunc.apply(
+                    q, k, v, beta,
+                    self.head_dim ** -0.5,
+                    self.state_cache,
+                    False,
+                    use_ho_pipeline,
+                )
+                if needs_cast:
+                    o = o.to(orig_dtype)
+            elif mode == 'fused_recurrent':
+                o, recurrent_state = fused_recurrent_delta_rule(
+                    q=q, k=k, v=v, beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=False,
+                )
+                if output_final_state and recurrent_state is not None:
+                    self.state_cache['recurrent_state'] = recurrent_state.detach()
+            elif mode == 'chunk':
+                orig_dtype = q.dtype
+                needs_cast = (orig_dtype == torch.float32)
+                if needs_cast:
+                    q_kv_dtype = torch.bfloat16
+                    q = q.to(q_kv_dtype)
+                    k = k.to(q_kv_dtype)
+                    v = v.to(q_kv_dtype)
+                    beta = beta.to(q_kv_dtype)
+
+                o, recurrent_state = chunk_delta_rule(
+                    q=q, k=k, v=v, beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=False,
+                    use_ho_pipeline=use_ho_pipeline,
+                )
+                if needs_cast:
+                    o = o.to(orig_dtype)
+                    if recurrent_state is not None:
+                        try:
+                            recurrent_state = recurrent_state.to(orig_dtype)
+                        except Exception:
+                            pass
+            else:
+                raise NotImplementedError(f"DeltaNet mode `{mode}` not supported.")
+
+        _deltanet_profile_end(profile_token)
+        return o
+
     def _qkvg_flat_pipeline_forward(self, hidden_states, hidden_states_bsh):
         """Two-stage diagnostic schedule with one global split point.
 
@@ -1421,6 +1502,7 @@ class DeltaNetAttention(MegatronModule):
                 or qkvg_pipeline_outer
             )
         )
+        qkvg_postprocessed = False
 
         if not qkvg_chunked and not qkvg_pipeline_flat:
             # ============ Projections (keep [s, b, h] for ColumnParallelLinear) ============
@@ -1434,14 +1516,41 @@ class DeltaNetAttention(MegatronModule):
                     v, _ = self.v_proj(hidden_states)  # [s, b, value_dim_per_partition]
                     g = None
 
-            # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
-            with _deltanet_profile("DeltaNetAttention.input_layout"):
-                if self.use_gate:
-                    q, k, v, g = _layout_qkvg_to_bsh(qkvg)
-                else:
-                    q = q.transpose(0, 1).contiguous()
-                    k = k.transpose(0, 1).contiguous()
-                    v = v.transpose(0, 1).contiguous()
+            fused_post = None
+            if (
+                self.use_gate
+                and self.use_short_conv
+                and self.qk_activation == 'silu'
+                and self.qk_norm == 'l2'
+                and args.pipe_sp_splits == 1
+                and not use_force_chunks
+                and not torch.is_grad_enabled()
+                and self.q_conv1d.bias is None
+                and self.k_conv1d.bias is None
+                and self.v_conv1d.bias is None
+            ):
+                with _deltanet_profile("DeltaNetAttention.qkvg_postprocess_fused"):
+                    fused_post = _qkvg_postprocess_fused(
+                        qkvg,
+                        self.q_conv1d.weight,
+                        self.k_conv1d.weight,
+                        self.v_conv1d.weight,
+                        (None, None, None),
+                        self.num_attention_heads_per_partition,
+                        self.head_dim,
+                    )
+            if fused_post is not None:
+                q, k, v, g, _ = fused_post
+                qkvg_postprocessed = True
+            else:
+                # Now transpose to DeltaNet convention: [s, b, h/tp] -> [b, s, h/tp]
+                with _deltanet_profile("DeltaNetAttention.input_layout"):
+                    if self.use_gate:
+                        q, k, v, g = _layout_qkvg_to_bsh(qkvg)
+                    else:
+                        q = q.transpose(0, 1).contiguous()
+                        k = k.transpose(0, 1).contiguous()
+                        v = v.transpose(0, 1).contiguous()
         else:
             q = k = v = g = None
 
@@ -1591,11 +1700,17 @@ class DeltaNetAttention(MegatronModule):
             use_conv_cache = (args.pipe_sp_splits > 1 and micro_sp_idx is not None
                               and micro_sp_idx > 0)
             output_final_state = (args.pipe_sp_splits > 1)
-            o = self._stateful_middle(
-                q, k, v, hidden_states_bsh,
-                use_conv_cache=use_conv_cache,
-                output_final_state=output_final_state,
-            )
+            if qkvg_postprocessed:
+                o = self._stateful_middle_preprocessed(
+                    q, k, v, hidden_states_bsh,
+                    output_final_state=output_final_state,
+                )
+            else:
+                o = self._stateful_middle(
+                    q, k, v, hidden_states_bsh,
+                    use_conv_cache=use_conv_cache,
+                    output_final_state=output_final_state,
+                )
 
         # ============ Output normalization & gate ============
         with _deltanet_profile("DeltaNetAttention.output_norm"):
